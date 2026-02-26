@@ -1,17 +1,18 @@
 import * as admin from 'firebase-admin';
 
 /**
- * Firebase Admin SDK - Hardcoded Initialization
- * FIX: Using direct credentials to bypass Vercel 500 errors.
+ * Firebase Admin SDK - Hardcoded Initialization with Heartbeat System
+ * FIX: Using direct credentials to bypass Vercel 500 errors permanently.
+ * ADDED: Heartbeat logic to track if the engine is running in the background.
  */
 
 function initializeFirebase(): admin.app.App {
-  // Check if app is already initialized
+  // Check if app is already initialized to prevent double loading
   if (admin.apps.length > 0) {
     return admin.apps[0]!;
   }
 
-  // Your new Firebase Key is now inside the code
+  // Your Firebase Key is hardcoded here so it never fails on Vercel
   const serviceAccount = {
     "type": "service_account",
     "project_id": "bhaag-df531",
@@ -26,7 +27,7 @@ function initializeFirebase(): admin.app.App {
     "universe_domain": "googleapis.com"
   };
 
-  // Handle private key formatting for Firebase
+  // Handle private key formatting (replace escaped \n with actual newlines)
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
   }
@@ -35,7 +36,7 @@ function initializeFirebase(): admin.app.App {
     credential: admin.credential.cert(serviceAccount),
   });
 
-  console.log('✅ Firebase Admin initialized with hardcoded key');
+  console.log('✅ Firebase Admin initialized with hardcoded key and Heartbeat system');
   return app;
 }
 
@@ -49,6 +50,7 @@ function getDb(): admin.firestore.Firestore {
   return _db;
 }
 
+// Exporting the database using a Proxy for lazy initialization
 export const db: admin.firestore.Firestore = new Proxy(
   {} as admin.firestore.Firestore,
   {
@@ -62,3 +64,22 @@ export const db: admin.firestore.Firestore = new Proxy(
     },
   }
 );
+
+/**
+ * 💓 NEW: Heartbeat Function
+ * Updates the 'system/status' document in Firestore with current time.
+ * Use this in your Cron API to see if the engine is alive.
+ */
+export async function updateEngineHeartbeat() {
+  try {
+    const database = getDb();
+    await database.collection('system').doc('status').set({
+      lastActive: admin.firestore.FieldValue.serverTimestamp(),
+      engineStatus: 'ONLINE',
+      message: 'GitHub Auto-Pilot is running background tasks'
+    }, { merge: true });
+    console.log('💓 Heartbeat Updated: Engine is Online');
+  } catch (error) {
+    console.error('❌ Heartbeat Failed:', error);
+  }
+}
