@@ -6,7 +6,7 @@ import {
   History, ChevronRight, ChevronDown, Film, Globe, Volume2, Sparkles, Home,
   Clock, CheckCircle2, XCircle, Trash2, RefreshCw, Bot, ListVideo,
   Zap, Cpu, Radio, TrendingUp, Film as FilmIcon, Tv2, Play, Pause, RefreshCcw,
-  AlertCircle, ChevronUp, Eye
+  AlertCircle, ChevronUp, Eye, Cloud, Smartphone, Wifi, WifiOff, Shield, Activity
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import LinkCard from '@/components/LinkCard';
@@ -27,6 +27,7 @@ interface Task {
   createdAt: string;
   links: any[];
   error?: string;
+  extractedBy?: 'Browser/Live' | 'Server/Auto-Pilot';
   preview?: {
     title: string;
     posterUrl: string | null;
@@ -59,6 +60,17 @@ interface QueueStats {
 
 type TabType = 'home' | 'processing' | 'completed' | 'failed' | 'history';
 type AutoPilotPhase = 'idle' | 'fetching' | 'running' | 'done' | 'stopped';
+
+interface EngineStatus {
+  signal: 'ONLINE' | 'OFFLINE';
+  status: string;
+  lastRunAt: string | null;
+  timeSinceLastRun: string;
+  details: string;
+  backgroundActive: boolean;
+  pendingCount: number;
+  processingCount: number;
+}
 
 // ============================================================================
 // HELPERS
@@ -132,15 +144,33 @@ export default function MflixApp() {
   const autoPilotActiveRef = useRef(false);
   const autoPilotLogRef = useRef<{ msg: string; type: 'info' | 'success' | 'error' | 'warn' }[]>([]);
 
+  // Engine Heartbeat Status
+  const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
+  const enginePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // ============================================================================
   // TASK POLLING
   // ============================================================================
 
   useEffect(() => {
     fetchTasks();
+    fetchEngineStatus();
     pollRef.current = setInterval(fetchTasks, 10000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    enginePollRef.current = setInterval(fetchEngineStatus, 30000); // Poll heartbeat every 30s
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+      if (enginePollRef.current) clearInterval(enginePollRef.current);
+    };
   }, []);
+
+  const fetchEngineStatus = async () => {
+    try {
+      const res = await fetch('/api/engine-status');
+      if (!res.ok) return;
+      const data = await res.json();
+      setEngineStatus(data);
+    } catch {}
+  };
 
   const fetchTasks = async () => {
     try {
@@ -280,7 +310,7 @@ export default function MflixApp() {
       const response = await fetch('/api/stream_solve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ links: linksToSend, taskId }),
+        body: JSON.stringify({ links: linksToSend, taskId, extractedBy: 'Browser/Live' }),
       });
       if (!response.ok) {
         setLiveStatuses(prev => {
@@ -756,16 +786,64 @@ export default function MflixApp() {
     <div className="max-w-2xl mx-auto px-4 py-8 pb-28">
 
       {/* HEADER */}
-      <header className="flex justify-between items-center mb-8">
+      <header className="flex justify-between items-center mb-4">
         <div className="text-2xl font-bold bg-gradient-to-br from-white to-slate-400 bg-clip-text text-transparent flex items-center gap-2">
           <Bolt className="text-indigo-500 fill-indigo-500" />
           MFLIX PRO
         </div>
         <div className="flex items-center gap-1.5 text-[10px] text-slate-500 font-mono">
-          <PulseDot color="bg-emerald-400" />
-          LIVE ENGINE
+          <PulseDot color={engineStatus?.signal === 'ONLINE' ? 'bg-emerald-400' : 'bg-rose-400'} />
+          {engineStatus?.signal === 'ONLINE' ? 'LIVE ENGINE' : 'ENGINE OFFLINE'}
         </div>
       </header>
+
+      {/* ENGINE STATUS BAR */}
+      {engineStatus && (
+        <div className={`mb-6 rounded-2xl border p-3 transition-all duration-500 ${
+          engineStatus.signal === 'ONLINE'
+            ? engineStatus.backgroundActive
+              ? 'border-emerald-500/30 bg-gradient-to-r from-emerald-950/40 via-slate-900/60 to-emerald-950/40'
+              : 'border-emerald-500/20 bg-emerald-950/20'
+            : 'border-rose-500/20 bg-rose-950/20'
+        }`}>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2.5">
+              <div className={`p-1.5 rounded-lg ${engineStatus.signal === 'ONLINE' ? 'bg-emerald-500/20' : 'bg-rose-500/20'}`}>
+                {engineStatus.signal === 'ONLINE'
+                  ? <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+                  : <WifiOff className="w-3.5 h-3.5 text-rose-400" />}
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className={`text-[10px] font-bold uppercase tracking-wider ${engineStatus.signal === 'ONLINE' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    GitHub Engine: {engineStatus.signal}
+                  </span>
+                  {engineStatus.backgroundActive && (
+                    <span className="flex items-center gap-1 text-[8px] font-bold px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/30">
+                      <Activity className="w-2.5 h-2.5 animate-pulse" />
+                      BACKGROUND ACTIVE
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 mt-0.5">
+                  {engineStatus.timeSinceLastRun && (
+                    <span className="text-[9px] text-slate-500 font-mono">Last ping: {engineStatus.timeSinceLastRun}</span>
+                  )}
+                  {engineStatus.pendingCount > 0 && (
+                    <span className="text-[9px] text-amber-400 font-mono">{engineStatus.pendingCount} pending</span>
+                  )}
+                </div>
+              </div>
+            </div>
+            {engineStatus.backgroundActive && (
+              <div className="flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg px-2.5 py-1.5">
+                <Shield className="w-3 h-3 text-emerald-400" />
+                <span className="text-[9px] text-emerald-300 font-bold">Safe to close browser</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* HOME: URL input + buttons + Auto-Pilot */}
       {activeTab === 'home' && (
@@ -1133,6 +1211,18 @@ export default function MflixApp() {
                     <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${trueStatus === 'completed' ? 'bg-emerald-500/20 text-emerald-400' : trueStatus === 'failed' ? 'bg-rose-500/20 text-rose-400' : 'bg-indigo-500/20 text-indigo-400 animate-pulse'}`}>
                       {trueStatus === 'processing' && activeTaskId === task.id ? '⚡ LIVE' : trueStatus}
                     </span>
+                    {/* Extraction Source Badge */}
+                    {task.extractedBy && (
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold flex items-center gap-1 ${
+                        task.extractedBy === 'Server/Auto-Pilot'
+                          ? 'bg-violet-500/20 text-violet-300 ring-1 ring-violet-500/30'
+                          : 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/25'
+                      }`}>
+                        {task.extractedBy === 'Server/Auto-Pilot'
+                          ? <><Cloud className="w-2.5 h-2.5" />Auto-Pilot</>
+                          : <><Smartphone className="w-2.5 h-2.5" />Live</>}
+                      </span>
+                    )}
                     <span className="text-slate-600 text-[10px]">{formatTime12h(task.createdAt)}</span>
                     {stats.total > 0 && (
                       <div className="flex items-center gap-1">
