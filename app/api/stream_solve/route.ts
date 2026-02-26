@@ -24,11 +24,13 @@ const fetchJSON = async (url: string, timeoutMs = 120000) => {
 export async function POST(req: Request) {
   let links: any[];
   let taskId: string | undefined;
+  let extractedBy: string = 'Browser/Live'; // Default: browser extraction
 
   try {
     const body = await req.json();
     links = body.links;
     taskId = body.taskId;
+    if (body.extractedBy) extractedBy = body.extractedBy;
   } catch {
     return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400 });
   }
@@ -191,6 +193,7 @@ export async function POST(req: Request) {
                 tx.update(taskRef, {
                   links: updated,
                   status: allDone ? (anySuccess ? 'completed' : 'failed') : 'processing',
+                  extractedBy,
                   ...(allDone ? { completedAt: new Date().toISOString() } : {}),
                 });
               });
