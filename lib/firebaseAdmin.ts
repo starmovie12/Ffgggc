@@ -1,19 +1,15 @@
 import * as admin from 'firebase-admin';
 
-/**
- * Firebase Admin SDK - Secure Lazy Initialization
- * SECURITY FIX: No hardcoded credentials. Reads safely from Vercel process.env.
- */
-
 function initializeFirebase(): admin.app.App {
   if (admin.apps.length > 0) {
     return admin.apps[0]!;
   }
 
+  // Vercel ki tijori (Environment Variables) se key uthayega
   const serviceAccountEnv = process.env.FIREBASE_SERVICE_ACCOUNT;
 
   if (!serviceAccountEnv) {
-    throw new Error('❌ Firebase credentials missing! Set FIREBASE_SERVICE_ACCOUNT in your Vercel environment variables.');
+    throw new Error('❌ Firebase credentials missing! Set FIREBASE_SERVICE_ACCOUNT in Vercel settings.');
   }
 
   let serviceAccount;
@@ -31,7 +27,7 @@ function initializeFirebase(): admin.app.App {
     credential: admin.credential.cert(serviceAccount),
   });
 
-  console.log('✅ Firebase Admin initialized safely using Vercel Env Var');
+  console.log('✅ Firebase Admin initialized safely!');
   return app;
 }
 
