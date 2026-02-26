@@ -155,6 +155,7 @@ export async function POST(req: Request) {
               url: sourceUrl, status: 'processing',
               preview: preview || null, metadata: metadata || null,
               links: resolved,
+              extractedBy: 'Server/Auto-Pilot',
               createdAt: new Date().toISOString(),
               updatedAt: new Date().toISOString(),
             }, { merge: true });
@@ -183,6 +184,7 @@ export async function POST(req: Request) {
           successfulLinks: success.length, failedLinks: resolved.length - success.length,
           status: 'active', createdAt: new Date().toISOString(),
           autoProcessed: true, queueRef: { id: queueId, collection },
+          extractedBy: 'Server/Auto-Pilot',
         };
 
         const ref = await db.collection(mainCol).add(doc);
