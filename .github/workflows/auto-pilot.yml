@@ -9,7 +9,7 @@ jobs:
   t0:
     name: 'Queue Run (0m)'
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - name: Run
         run: |
@@ -19,7 +19,7 @@ jobs:
   t1:
     name: 'Queue Run (1m)'
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - run: sleep 60
       - name: Run
@@ -30,7 +30,7 @@ jobs:
   t2:
     name: 'Queue Run (2m)'
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - run: sleep 120
       - name: Run
@@ -41,7 +41,7 @@ jobs:
   t3:
     name: 'Queue Run (3m)'
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - run: sleep 180
       - name: Run
@@ -52,7 +52,7 @@ jobs:
   t4:
     name: 'Queue Run (4m)'
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - run: sleep 240
       - name: Run
