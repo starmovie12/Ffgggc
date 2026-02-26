@@ -152,6 +152,7 @@ export async function POST(req: Request) {
       url: trimmedUrl,
       status: 'processing',
       createdAt: new Date().toISOString(),
+      extractedBy: 'Browser/Live',
       metadata: listResult.status === 'success' ? listResult.metadata : null,
       preview: listResult.status === 'success' ? (listResult as any).preview : null,
       links:
