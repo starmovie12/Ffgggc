@@ -13,8 +13,7 @@ jobs:
     steps:
       - name: Run
         run: |
-          curl -sf -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            "${{ secrets.APP_BASE_URL }}/api/cron/process-queue" || true
+          curl -sf "https://ffgggc-hztr.vercel.app/api/cron/process-queue" || true
 
   t1:
     name: 'Queue Run (1m)'
@@ -24,8 +23,7 @@ jobs:
       - run: sleep 60
       - name: Run
         run: |
-          curl -sf -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            "${{ secrets.APP_BASE_URL }}/api/cron/process-queue" || true
+          curl -sf "https://ffgggc-hztr.vercel.app/api/cron/process-queue" || true
 
   t2:
     name: 'Queue Run (2m)'
@@ -35,8 +33,7 @@ jobs:
       - run: sleep 120
       - name: Run
         run: |
-          curl -sf -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            "${{ secrets.APP_BASE_URL }}/api/cron/process-queue" || true
+          curl -sf "https://ffgggc-hztr.vercel.app/api/cron/process-queue" || true
 
   t3:
     name: 'Queue Run (3m)'
@@ -46,8 +43,7 @@ jobs:
       - run: sleep 180
       - name: Run
         run: |
-          curl -sf -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            "${{ secrets.APP_BASE_URL }}/api/cron/process-queue" || true
+          curl -sf "https://ffgggc-hztr.vercel.app/api/cron/process-queue" || true
 
   t4:
     name: 'Queue Run (4m)'
@@ -57,5 +53,4 @@ jobs:
       - run: sleep 240
       - name: Run
         run: |
-          curl -sf -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
-            "${{ secrets.APP_BASE_URL }}/api/cron/process-queue" || true
+          curl -sf "https://ffgggc-hztr.vercel.app/api/cron/process-queue" || true
