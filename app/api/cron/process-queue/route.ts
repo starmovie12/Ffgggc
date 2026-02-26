@@ -186,15 +186,32 @@ export async function GET(req: Request) {
       retryCount,
     });
 
+    // ── FIX 1: Ensure base URL is clean without trailing slash ──
+    let base = process.env.NEXT_PUBLIC_BASE_URL || '';
+    if (base.endsWith('/')) {
+        base = base.slice(0, -1);
+    }
+    
+    // Fallback if env variable is missing
+    if (!base) {
+        base = 'https://ffgggc-hztr.vercel.app';
+    }
+
     // ── Step 5: Create task via /api/tasks ──
-    const base = process.env.NEXT_PUBLIC_BASE_URL!;
+    console.log(`[Engine] Calling ${base}/api/tasks for URL: ${item.url}`);
     const taskRes = await fetch(`${base}/api/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: item.url }),
     });
 
-    if (!taskRes.ok) throw new Error(`/api/tasks HTTP ${taskRes.status}`);
+    if (!taskRes.ok) {
+        // Log the exact text returned to know why it failed
+        const errText = await taskRes.text();
+        console.error(`[Engine] Task Creation Failed:`, errText);
+        throw new Error(`/api/tasks HTTP ${taskRes.status}: ${errText.substring(0, 50)}`);
+    }
+    
     const taskData = await taskRes.json();
     if (taskData.error) throw new Error(taskData.error);
 
@@ -237,16 +254,26 @@ export async function GET(req: Request) {
             buf = lines.pop() || '';
             for (const l of lines) {
               try {
-                const d = JSON.parse(l);
-                if (d.status === 'done') ok++;
-              } catch {}
+                // FIX 2: Safely parse JSON lines
+                if (l.trim() !== '') {
+                    const d = JSON.parse(l);
+                    if (d.status === 'done' || d.status === 'success') ok++;
+                }
+              } catch (parseErr) {
+                  // Ignore parse errors on partial streams
+              }
             }
           }
+          // Consider it a success if at least one link was extracted
           success = ok > 0;
+        } else {
+             console.error(`[Engine] Stream Solve Failed with status: ${solveRes.status}`);
         }
       } else {
         success = true;
       }
+    } else {
+         console.log(`[Engine] No links found for task ID: ${taskId}`);
     }
 
     // ── Step 7: Update queue status ──
@@ -283,8 +310,13 @@ export async function GET(req: Request) {
     });
 
   } catch (e: any) {
+    // FIX 3: Detailed error reporting
+    console.error(`[CRON ERROR]`, e);
     await updateHeartbeat('error', e.message);
     await sendTelegram(`🚨 <b>CRON ERROR</b>\n${e.message}`);
-    return NextResponse.json({ error: e.message }, { status: 500 });
+    
+    // We still return 200 to GitHub so it doesn't think the webhook itself is broken
+    // The task logic will be retried in the next 5 mins
+    return NextResponse.json({ error: e.message, status: "failed_internally" }, { status: 200 });
   }
 }
