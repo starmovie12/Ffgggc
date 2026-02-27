@@ -119,8 +119,8 @@ export async function GET(req: Request) {
         }
       };
       const [hubcloud, timer] = await Promise.all([
-        pingService('http://85.121.5.246:5001/'),
-        pingService('http://85.121.5.246:10000/'),
+        pingService(`${process.env.VPS_BASE_URL || 'http://85.121.5.246'}:${process.env.HUBCLOUD_PORT || '5001'}/`),
+        pingService(`${process.env.VPS_BASE_URL || 'http://85.121.5.246'}:${process.env.TIMER_PORT || '10000'}/`),
       ]);
       return NextResponse.json({
         hubcloud: { ...hubcloud, port: 5001 },
