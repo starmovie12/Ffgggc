@@ -1,24 +1,5 @@
-/**
- * /api/solve_task — SERVER-SIDE NON-STREAMING PARALLEL SOLVER
- *
- * This is the CORE backend engine. Both the GitHub cron AND the browser
- * Auto-Pilot call this endpoint. It does NOT stream — it processes all
- * links, saves results to Firebase, and returns a JSON summary.
- *
- * ✅ Smart Parallel Processing — direct links fire simultaneously
- * ✅ VPS Protection            — timer links stay sequential
- * ✅ Per-link Timeout (25s)    — no single link blocks forever
- * ✅ Overall Guard (50s)       — ensures we finish within Vercel's 60s
- * ✅ Auto Retry (2×)           — transient errors retried automatically
- * ✅ Atomic Firestore Writes   — parallel writes never corrupt data
- * ✅ Works with browser closed  — runs as independent serverless function
- */
-
-export const dynamic = 'force-dynamic';
-export const maxDuration = 60;
-
-import { NextResponse } from 'next/server';
-import { db } from '@/lib/firebaseAdmin';
+import { NextRequest, NextResponse } from 'next/server';
+import { db, admin } from '@/lib/firebaseAdmin';
 import {
   solveHBLinks,
   solveHubCDN,
@@ -26,342 +7,398 @@ import {
   solveHubCloudNative,
   solveGadgetsWebNative,
 } from '@/lib/solvers';
+// v3 FIX: SARE constants config se import karo — KUCH BHI locally define mat karo
+import {
+  TIMER_API,          // Base URL — suffix yahan add karo: `${TIMER_API}/solve?url=...`
+  TIMER_DOMAINS,
+  TARGET_DOMAINS,
+  LINK_TIMEOUT_MS,
+  OVERALL_TIMEOUT_MS,
+} from '@/lib/config';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const TIMER_API = 'http://85.121.5.246:10000/solve?url=';
-const TIMER_DOMAINS = ['gadgetsweb', 'review-tech', 'ngwin', 'cryptoinsights'] as const;
-const TARGET_DOMAINS = ['hblinks', 'hubdrive', 'hubcdn', 'hubcloud'] as const;
-const LINK_TIMEOUT_MS = 25_000; // 25s per-link hard cap
-const OVERALL_TIMEOUT_MS = 50_000; // 50s overall guard (leaves 10s margin for Vercel)
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
-// ─── Timeout-aware fetch helper ───────────────────────────────────────────────
+// ─── HELPER 1: fetchWithTimeout ───────────────────────────────────────────────
+// VPS API call with AbortController timeout
 async function fetchWithTimeout(url: string, timeoutMs = 20_000): Promise<any> {
-  const ctrl = new AbortController();
+  const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      signal: ctrl.signal,
+      signal:  ctrl.signal,
       headers: { 'User-Agent': 'MflixPro/3.0' },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
+  } catch (err: any) {
+    if (err.name === 'AbortError') throw new Error('Timed out');
+    throw err;
   } finally {
     clearTimeout(timer);
   }
 }
 
-// ─── Firestore atomic write (save one link result) ───────────────────────────
-async function saveResultToFirestore(
+// ─── HELPER 2: saveResultToFirestore ─────────────────────────────────────────
+// FIX B — Sub-collection architecture. Zero Firestore contention.
+// v5 TRAP 5 FIX — Conditional increment: deferred (pending) links never count.
+export async function saveResultToFirestore(
   taskId: string,
   lid: number | string,
   linkUrl: string,
-  result: any,
+  result: {
+    status?: string;
+    finalLink?: string | null;
+    error?: string | null;
+    logs?: any[];
+    best_button_name?: string | null;
+    all_available_buttons?: any[];
+  },
   extractedBy: string,
 ): Promise<void> {
-  const taskRef = db.collection('scraping_tasks').doc(taskId);
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(taskRef);
-    if (!snap.exists) return;
+  // TIER 1: Sub-collection pe direct write — NO transaction, zero contention
+  const resultRef = db
+    .collection('scraping_tasks').doc(taskId)
+    .collection('results').doc(String(lid));
 
-    const existing = snap.data()?.links || [];
-    const updated = existing.map((l: any) => {
-      if (l.id === lid || l.link === linkUrl) {
-        return {
-          ...l,
-          finalLink: result.finalLink || l.finalLink || null,
-          status: result.status || 'error',
-          error: result.error || null,
-          logs: result.logs || [],
-          best_button_name: result.best_button_name || null,
-          all_available_buttons: result.all_available_buttons || [],
-          solvedAt: new Date().toISOString(),
-        };
-      }
-      return l;
-    });
-
-    const allDone = updated.every((l: any) =>
-      ['done', 'success', 'error', 'failed'].includes((l.status || '').toLowerCase())
-    );
-    const anySuccess = updated.some((l: any) =>
-      ['done', 'success'].includes((l.status || '').toLowerCase())
-    );
-
-    tx.update(taskRef, {
-      links: updated,
-      status: allDone ? (anySuccess ? 'completed' : 'failed') : 'processing',
-      extractedBy,
-      ...(allDone ? { completedAt: new Date().toISOString() } : {}),
-    });
+  await resultRef.set({
+    lid,
+    linkUrl,
+    finalLink:             result.finalLink            ?? null,
+    status:                result.status               ?? 'error',
+    error:                 result.error                ?? null,
+    logs:                  result.logs                 ?? [],
+    best_button_name:      result.best_button_name     ?? null,
+    all_available_buttons: result.all_available_buttons ?? [],
+    extractedBy,
+    solvedAt: new Date().toISOString(),
   });
+
+  // TIER 2: Master doc — ATOMIC INCREMENT (v4 TRAP 1 FIX)
+  // ❌ PURANA (v3): resultsSnap.get() se SARE results count karo → 1250 reads/task
+  // ✅ NAYA (v4): FieldValue.increment(1) → ZERO extra reads, sirf 1 write
+  // 🚨 v5 TRAP 5 FIX: SIRF non-pending results increment karein — deferred links NAHI
+  try {
+    const taskRef = db.collection('scraping_tasks').doc(taskId);
+
+    // v5 TRAP 5 FIX: Conditional increment — deferred (pending) links skip
+    const effectiveStatus = result.status ?? 'error';
+    if (effectiveStatus !== 'pending') {
+      await taskRef.update({
+        completedLinksCount: admin.firestore.FieldValue.increment(1),
+      });
+    }
+
+    // Ab check karo ki sab links done hain ya nahi — 1 read of master doc
+    const masterSnap = await taskRef.get();
+    if (!masterSnap.exists) return;
+
+    const data           = masterSnap.data()!;
+    const totalLinks: number    = (data.links ?? []).length;
+    const completedCount: number = data.completedLinksCount ?? 0;
+
+    // Sirf tab master status update karo jab sab links complete ho jaayein
+    if (completedCount >= totalLinks && totalLinks > 0) {
+      // Results sub-collection se final status check karo (sirf EK baar, jab sab done)
+      const resultsSnap = await db
+        .collection('scraping_tasks').doc(taskId)
+        .collection('results').get();
+
+      const allResults = resultsSnap.docs.map(d => d.data());
+      const anySuccess = allResults.some(r => ['done', 'success'].includes(r.status ?? ''));
+
+      await taskRef.update({
+        status: anySuccess ? 'completed' : 'failed',
+        completedAt: new Date().toISOString(),
+      });
+    }
+    // Agar abhi sab done nahi → kuch mat karo, cron next run mein check karega
+  } catch (e: any) {
+    console.error(`[saveResult] Master status update failed:`, e.message);
+  }
 }
 
-// ─── Core single-link solver ──────────────────────────────────────────────────
-async function processLink(
+// ─── HELPER 3: processLink ────────────────────────────────────────────────────
+// FIX D: lid param is always l.id — never indexOf
+// attempt = 1 → auto-retry on fail (attempt 2 called automatically)
+export async function processLink(
   linkData: any,
-  idx: number,
+  lid: number | string,
   taskId: string,
   extractedBy: string,
   attempt = 1,
-): Promise<{ lid: number; status: string; finalLink?: string }> {
-  const lid = linkData.id ?? idx;
-  const originalUrl = linkData.link as string;
+): Promise<{ lid: number | string; status: string; finalLink?: string }> {
+  const originalUrl = linkData.link;
+  let   currentLink = originalUrl;
   const logs: { msg: string; type: string }[] = [];
-  const log = (msg: string, type = 'info') => logs.push({ msg, type });
 
-  let result: any = { ...linkData, status: 'error', error: 'Unknown error', logs };
-
+  // ─── Inner solving chain ─────────────────────────────────────────────────────
   const solveWork = async () => {
-    if (!originalUrl || typeof originalUrl !== 'string') {
-      log('❌ No link URL', 'error');
-      return;
+    // 4a — HubCDN.fans shortcut
+    if (currentLink.includes('hubcdn.fans')) {
+      logs.push({ msg: '⚡ HubCDN.fans detected — direct solve', type: 'info' });
+      const r = await solveHubCDN(currentLink);
+      if (r.status === 'success') {
+        return { finalLink: r.final_link, status: 'done', logs };
+      }
+      return { status: 'error', error: r.message, logs };
     }
 
-    let currentLink = originalUrl;
-    log(`🔍 [attempt ${attempt}/2] ${currentLink.slice(0, 60)}`, 'info');
+    // 4b — Timer Bypass Loop (max 3 iterations)
+    // review-tech, ngwin, cryptoinsights → VPS port 10000 SEQUENTIAL
+    // gadgetsweb → native solve
+    let loopCount = 0;
+    while (loopCount < 3 && !TARGET_DOMAINS.some(d => currentLink.includes(d))) {
+      if (!TIMER_DOMAINS.some(d => currentLink.includes(d)) && loopCount === 0) break;
 
-    try {
-      // ── 1. HubCDN.fans ──
-      if (currentLink.includes('hubcdn.fans')) {
-        log('⚡ HubCDN processing...', 'info');
-        const r = await solveHubCDN(currentLink);
+      if (currentLink.includes('gadgetsweb')) {
+        logs.push({ msg: `🔁 GadgetsWeb native solve (loop ${loopCount + 1})`, type: 'info' });
+        const r = await solveGadgetsWebNative(currentLink);
         if (r.status === 'success') {
-          log('✅ HubCDN done', 'success');
-          result = { ...linkData, finalLink: r.final_link, status: 'done', logs };
-        } else {
-          log(`❌ HubCDN: ${r.message}`, 'error');
-          result = { ...linkData, status: 'error', error: r.message, logs };
-        }
-        return;
-      }
-
-      // ── 2. Timer bypass ──
-      let loopCount = 0;
-      while (loopCount < 3 && !TARGET_DOMAINS.some(d => currentLink.includes(d))) {
-        const isTimerLink = TIMER_DOMAINS.some(x => currentLink.includes(x));
-        if (!isTimerLink) break;
-
-        log(`⏳ Timer bypass (loop ${loopCount + 1})...`, 'warn');
-        try {
-          if (currentLink.includes('gadgetsweb')) {
-            const r = await solveGadgetsWebNative(currentLink);
-            if (r.status === 'success' && r.link) {
-              currentLink = r.link;
-              log('✅ Timer bypassed (GadgetsWeb)', 'success');
-            } else {
-              log(`❌ GadgetsWeb: ${r.message}`, 'error');
-              break;
-            }
-          } else {
-            const r = await fetchWithTimeout(TIMER_API + encodeURIComponent(currentLink), 20_000);
-            if (r.status === 'success' && r.extracted_link) {
-              currentLink = r.extracted_link;
-              log('✅ Timer bypassed (VPS)', 'success');
-            } else {
-              log(`❌ VPS timer: ${r.message || 'no link'}`, 'error');
-              break;
-            }
-          }
-        } catch (e: any) {
-          log(`❌ Timer error: ${e.message}`, 'error');
-          break;
-        }
-        loopCount++;
-      }
-
-      // ── 3. HBLinks ──
-      if (currentLink.includes('hblinks')) {
-        log('🔗 Solving HBLinks...', 'info');
-        const r = await solveHBLinks(currentLink);
-        if (r.status === 'success' && r.link) {
           currentLink = r.link;
-          log('✅ HBLinks solved', 'success');
-        } else {
-          log(`❌ HBLinks: ${r.message}`, 'error');
-          result = { ...linkData, status: 'error', error: r.message, logs };
-          return;
+          loopCount++;
+          continue;
         }
-      }
-
-      // ── 4. HubDrive ──
-      if (currentLink.includes('hubdrive')) {
-        log('☁️ Solving HubDrive...', 'info');
-        const r = await solveHubDrive(currentLink);
-        if (r.status === 'success' && r.link) {
-          currentLink = r.link;
-          log('✅ HubDrive solved', 'success');
-        } else {
-          log(`❌ HubDrive: ${r.message}`, 'error');
-          result = { ...linkData, status: 'error', error: r.message, logs };
-          return;
+        logs.push({ msg: `❌ GadgetsWeb failed: ${r.message}`, type: 'error' });
+        break;
+      } else {
+        // review-tech, ngwin, cryptoinsights — VPS timer bypass
+        // FIX: TIMER_API from config — NOT hardcoded IP, suffix added here
+        logs.push({ msg: `⏱ Timer bypass via VPS (loop ${loopCount + 1})`, type: 'info' });
+        const r = await fetchWithTimeout(
+          `${TIMER_API}/solve?url=${encodeURIComponent(currentLink)}`,
+          20_000,
+        );
+        if (r.status === 'success' && r.extracted_link) {
+          currentLink = r.extracted_link;
+          loopCount++;
+          continue;
         }
+        logs.push({ msg: `❌ Timer bypass failed`, type: 'error' });
+        break;
       }
-
-      // ── 5. HubCloud / HubCDN ──
-      if (currentLink.includes('hubcloud') || currentLink.includes('hubcdn')) {
-        log('⚡ Solving HubCloud...', 'info');
-        const r = await solveHubCloudNative(currentLink);
-        if (r.status === 'success' && r.best_download_link) {
-          log(`🎉 Done via ${r.best_button_name || 'Download'}`, 'success');
-          result = {
-            ...linkData,
-            finalLink: r.best_download_link,
-            status: 'done',
-            logs,
-            best_button_name: r.best_button_name || null,
-            all_available_buttons: r.all_available_buttons || [],
-          };
-        } else {
-          log(`❌ HubCloud: ${r.message}`, 'error');
-          result = { ...linkData, status: 'error', error: r.message, logs };
-        }
-        return;
-      }
-
-      // ── 6. No solver matched ──
-      log('❌ Unrecognised link — no solver matched', 'error');
-      result = { ...linkData, status: 'error', error: 'No solver matched', logs };
-
-    } catch (e: any) {
-      log(`⚠️ Unexpected error: ${e.message}`, 'error');
-      result = { ...linkData, status: 'error', error: e.message, logs };
     }
+
+    // 4c — HBLinks resolver
+    if (currentLink.includes('hblinks')) {
+      logs.push({ msg: '🔗 HBLinks solving...', type: 'info' });
+      const r = await solveHBLinks(currentLink);
+      if (r.status === 'success') {
+        currentLink = r.link;
+      } else {
+        return { status: 'error', error: r.message, logs };
+      }
+    }
+
+    // 4d — HubDrive resolver
+    if (currentLink.includes('hubdrive')) {
+      logs.push({ msg: '💾 HubDrive solving...', type: 'info' });
+      const r = await solveHubDrive(currentLink);
+      if (r.status === 'success') {
+        currentLink = r.link;
+      } else {
+        return { status: 'error', error: r.message, logs };
+      }
+    }
+
+    // 4e — HubCloud / HubCDN final resolver
+    if (currentLink.includes('hubcloud') || currentLink.includes('hubcdn')) {
+      logs.push({ msg: '☁️ HubCloud solving...', type: 'info' });
+      const r = await solveHubCloudNative(currentLink);
+      if (r.status === 'success') {
+        logs.push({ msg: `✅ HubCloud done: ${r.best_download_link}`, type: 'success' });
+        return {
+          finalLink:             r.best_download_link,   // ← HubCloudNativeResult uses best_download_link
+          status:                'done',
+          best_button_name:      r.best_button_name      ?? null,
+          all_available_buttons: r.all_available_buttons ?? [],
+          logs,
+        };
+      }
+      return { status: 'error', error: r.message, logs };
+    }
+
+    // 4f — GDflix / DriveHub
+    if (currentLink.includes('gdflix') || currentLink.includes('drivehub')) {
+      logs.push({ msg: `✅ GDflix/DriveHub resolved: ${currentLink}`, type: 'success' });
+      return { finalLink: currentLink, status: 'done', logs };
+    }
+
+    // 4f — No solver matched
+    return { status: 'error', error: 'No solver matched for this URL', logs };
   };
 
-  // Per-link timeout race
-  const timeout = new Promise<void>((_, reject) =>
-    setTimeout(() => reject(new Error(`Timed out after ${LINK_TIMEOUT_MS / 1000}s`)), LINK_TIMEOUT_MS)
-  );
-
+  // ─── Per-link timeout race ────────────────────────────────────────────────────
+  let result: any;
   try {
-    await Promise.race([solveWork(), timeout]);
-  } catch (e: any) {
-    log(`⏱️ ${e.message}`, 'error');
-    result = { ...linkData, status: 'error', error: e.message, logs };
+    result = await Promise.race([
+      solveWork(),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Timed out after ${LINK_TIMEOUT_MS / 1000}s`)),
+          LINK_TIMEOUT_MS,
+        ),
+      ),
+    ]);
+  } catch (err: any) {
+    result = { status: 'error', error: err.message, logs };
   }
 
-  // Auto-retry once on failure
+  // ─── Auto-Retry: attempt 1 fail → attempt 2 automatically ────────────────────
   if (result.status === 'error' && attempt === 1) {
-    log('🔄 Auto-retrying (attempt 2/2)...', 'warn');
-    return processLink(linkData, idx, taskId, extractedBy, 2);
+    logs.push({ msg: '🔄 Auto-retrying (attempt 2/2)...', type: 'warn' });
+    return processLink(linkData, lid, taskId, extractedBy, 2);
   }
 
-  // Save final result to Firestore immediately
-  try {
-    await saveResultToFirestore(taskId, lid, originalUrl, result, extractedBy);
-  } catch (e: any) {
-    console.error(`[solve_task] DB write failed lid=${lid}:`, e.message);
-  }
+  // ─── Save to Firestore (FIX B: sub-collection) ───────────────────────────────
+  await saveResultToFirestore(taskId, lid, originalUrl, { ...result, logs }, extractedBy);
 
   return { lid, status: result.status, finalLink: result.finalLink };
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
-export async function POST(req: Request) {
-  // Accept both CRON_SECRET auth and x-mflix-internal header (for browser auto-pilot)
-  const auth = req.headers.get('authorization');
-  const internalHeader = req.headers.get('x-mflix-internal');
-  const isAuthorized = auth === `Bearer ${process.env.CRON_SECRET}` || internalHeader === 'true';
-
-  if (!isAuthorized) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+// ─── POST /api/solve_task ─────────────────────────────────────────────────────
+export async function POST(req: NextRequest) {
+  // ─── Auth — dono accept karo ─────────────────────────────────────────────────
+  // Authorization: Bearer {CRON_SECRET} (GitHub Cron se)
+  // x-mflix-internal: true (future internal tool calls ke liye — reserved)
+  const cronSecret = process.env.CRON_SECRET;
+  if (cronSecret) {
+    const authHeader     = req.headers.get('Authorization') || '';
+    const internalHeader = req.headers.get('x-mflix-internal') || '';
+    const isBearer   = authHeader === `Bearer ${cronSecret}`;
+    const isInternal = internalHeader === 'true';
+    if (!isBearer && !isInternal) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
   }
 
-  let taskId: string, links: any[], extractedBy: string;
+  let body: any;
   try {
-    const body = await req.json();
-    taskId = body.taskId;
-    links = body.links;
-    extractedBy = body.extractedBy || 'Server/Auto-Pilot';
+    body = await req.json();
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
+    return NextResponse.json({ error: 'Invalid JSON in request body' }, { status: 400 });
   }
 
-  if (!taskId || !Array.isArray(links) || links.length === 0) {
-    return NextResponse.json({ error: 'taskId and non-empty links required' }, { status: 400 });
+  const taskId      = body?.taskId      as string;
+  const bodyLinks   = body?.links       as any[] | undefined;
+  const extractedBy = (body?.extractedBy as string) || 'Browser/Live';
+
+  // Validation: taskId aur links dono required
+  if (!taskId) {
+    return NextResponse.json({ error: 'taskId is required' }, { status: 400 });
   }
 
-  // Mark task as processing
   try {
+    const taskSnap = await db.collection('scraping_tasks').doc(taskId).get();
+    if (!taskSnap.exists) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 });
+    }
+
+    const data = taskSnap.data()!;
+
+    // Links: body se aayen toh use karo, warna Firestore se lo (cron direct call ke liye)
+    const allLinks: any[] = (bodyLinks && bodyLinks.length > 0)
+      ? bodyLinks
+      : (data.links || []);
+
+    const pendingLinks = allLinks.filter(
+      (l: any) => !l.status || l.status === 'pending' || l.status === 'processing',
+    );
+
+    if (!pendingLinks.length) {
+      return NextResponse.json({ ok: true, taskId, processed: 0, done: 0, errors: 0 });
+    }
+
+    // ─── Step 1: Mark task as 'processing' ───────────────────────────────────
     await db.collection('scraping_tasks').doc(taskId).update({
-      status: 'processing',
-      extractedBy,
+      status:              'processing',
+      extractedBy:         extractedBy || 'Unknown',
       processingStartedAt: new Date().toISOString(),
     });
-  } catch { /* non-fatal */ }
 
-  // Overall timeout guard
-  const overallStart = Date.now();
+    // ─── Step 2: Start overall timer ─────────────────────────────────────────
+    const overallStart = Date.now();
 
-  // ─── SMART ROUTING ──────────────────────────────────────────────────────
-  // 🚀 DIRECT links → Promise.allSettled (parallel)
-  // 🛡️ TIMER links → Sequential (protect VPS)
-  // Both groups run CONCURRENTLY with each other.
+    // ─── Step 3: Smart Routing ───────────────────────────────────────────────
+    // Timer links (gadgetsweb, review-tech, ngwin, cryptoinsights) → SEQUENTIAL
+    // Direct links (hblinks, hubdrive, hubcdn, hubcloud, gdflix, drivehub) → PARALLEL
+    const timerLinks  = pendingLinks.filter((l: any) => TIMER_DOMAINS.some(d => l.link?.includes(d)));
+    const directLinks = pendingLinks.filter((l: any) => !TIMER_DOMAINS.some(d => l.link?.includes(d)));
 
-  const timerLinks = links.filter(l => TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
-  const directLinks = links.filter(l => !TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
+    const TIME_BUDGET_MS = 45_000; // FIX C: 45s hard cap — 15s buffer before Vercel 60s kill
 
-  console.log(`[solve_task] ${taskId} | ${directLinks.length} direct (parallel) + ${timerLinks.length} timer (sequential)`);
+    // Direct links — PARALLEL (Promise.allSettled)
+    // FIX D: l.id, not indexOf
+    const directPromises = directLinks.map((l: any) =>
+      processLink(l, l.id, taskId, extractedBy),
+    );
 
-  const results: { lid: number; status: string; finalLink?: string }[] = [];
+    // Timer links — SEQUENTIAL with TIME BUDGET (FIX C — index-based loop)
+    const timerPromise = (async () => {
+      const timerResults: any[] = [];
 
-  // Direct links — fire all at once
-  const directPromises = directLinks.map(l =>
-    processLink(l, links.indexOf(l), taskId, extractedBy)
-  );
+      // v3 FIX: index-based loop — timerLinks.indexOf(l) USE MAT KARO
+      for (let i = 0; i < timerLinks.length; i++) {
+        const l = timerLinks[i];
 
-  // Timer links — sequential to protect VPS
-  const timerPromise = (async () => {
-    const timerResults: typeof results = [];
-    for (const l of timerLinks) {
-      // Check overall timeout
-      if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) {
-        console.warn(`[solve_task] Overall timeout reached, marking remaining timer links as error`);
-        // Mark remaining as timed out
-        const remaining = timerLinks.slice(timerLinks.indexOf(l));
-        for (const rl of remaining) {
-          const lid = rl.id ?? links.indexOf(rl);
-          try {
-            await saveResultToFirestore(taskId, lid, rl.link, {
-              status: 'error',
-              error: 'Overall timeout - will retry next run',
-              logs: [{ msg: '⏱️ Skipped due to overall timeout', type: 'error' }],
-            }, extractedBy);
-          } catch {}
-          timerResults.push({ lid, status: 'error' });
+        // FIX C: Budget check BEFORE processLink — clean exit guaranteed
+        if (Date.now() - overallStart > TIME_BUDGET_MS) {
+          // v4 TRAP 3 FIX: Promise.all() — PARALLEL save, NOT sequential loop
+          // ❌ v3: sequential await = 15 links × 500ms = 7.5s = Vercel hard-kill
+          // ✅ v4: Promise.all = all parallel = ~500ms total
+          await Promise.all(
+            timerLinks.slice(i).map((deferred: any) =>
+              saveResultToFirestore(taskId, deferred.id, deferred.link, {
+                status:    'pending',
+                error:     null,
+                finalLink: null,
+                logs: [{
+                  msg: `⏳ Time budget exceeded (${TIME_BUDGET_MS / 1000}s) — deferred to next cron run`,
+                  type: 'warn',
+                }],
+              }, extractedBy),
+            ),
+          );
+          break; // Clean exit — no Vercel hard-kill
         }
-        break;
+
+        // FIX D: l.id not indexOf
+        const r = await processLink(l, l.id, taskId, extractedBy);
+        timerResults.push(r);
       }
-      const r = await processLink(l, links.indexOf(l), taskId, extractedBy);
-      timerResults.push(r);
-    }
-    return timerResults;
-  })();
 
-  // Run both groups concurrently
-  const [directSettled, timerResult] = await Promise.all([
-    Promise.allSettled(directPromises),
-    timerPromise,
-  ]);
+      return timerResults;
+    })();
 
-  // Collect results
-  for (const s of directSettled) {
-    if (s.status === 'fulfilled') results.push(s.value);
+    // Run both groups concurrently
+    const [directSettled, timerResults] = await Promise.all([
+      Promise.allSettled(directPromises),
+      timerPromise,
+    ]);
+
+    // ─── Step 4: Count results ────────────────────────────────────────────────
+    const directDone = directSettled.filter(
+      r => r.status === 'fulfilled' && (r.value as any)?.status === 'done',
+    ).length;
+    const timerDone = (timerResults as any[]).filter(
+      r => r?.status === 'done' || r?.status === 'success',
+    ).length;
+    const doneCount  = directDone + timerDone;
+    const errorCount = pendingLinks.length - doneCount;
+
+    return NextResponse.json({
+      ok:          true,
+      taskId,
+      processed:   pendingLinks.length,
+      done:        doneCount,
+      errors:      errorCount,
+      directCount: directLinks.length,
+      timerCount:  timerLinks.length,
+    });
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
-  results.push(...timerResult);
-
-  const doneCount = results.filter(r => r.status === 'done').length;
-  const errorCount = results.filter(r => r.status === 'error').length;
-
-  console.log(`[solve_task] ${taskId} | Done: ${doneCount}, Errors: ${errorCount}`);
-
-  return NextResponse.json({
-    ok: true,
-    taskId,
-    processed: links.length,
-    done: doneCount,
-    errors: errorCount,
-    directCount: directLinks.length,
-    timerCount: timerLinks.length,
-  });
 }
+
+// FIX A — Named exports for cron to import directly (ZERO nested HTTP)
+export { processLink, saveResultToFirestore };
