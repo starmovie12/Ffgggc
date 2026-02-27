@@ -1,6 +1,6 @@
 'use client';
 
-import { Video, CircleCheck, CircleDashed, Copy, Check, AlertCircle } from 'lucide-react';
+import { Video, CircleCheck, CircleDashed, Copy, Check, AlertCircle, ExternalLink } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -34,8 +34,16 @@ export default function LinkCard({ id, name, logs, finalLink, status }: LinkCard
       setCopied(true);
       if (navigator.vibrate) navigator.vibrate(50);
       setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy: ', err);
+    } catch {
+      // fallback
+      const el = document.createElement('textarea');
+      el.value = finalLink;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     }
   };
 
@@ -43,7 +51,7 @@ export default function LinkCard({ id, name, logs, finalLink, status }: LinkCard
     switch (status) {
       case 'done': return 'border-emerald-500 bg-emerald-500/5';
       case 'error': return 'border-rose-500 bg-rose-500/5';
-      default: return 'border-indigo-500 bg-white/5';
+      default: return 'border-indigo-500/50 bg-white/5';
     }
   };
 
@@ -61,27 +69,28 @@ export default function LinkCard({ id, name, logs, finalLink, status }: LinkCard
     <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
-      className={`p-4 mb-4 rounded-2xl border-l-4 backdrop-blur-md border transition-all duration-300 ${getStatusColor()}`}
+      className={`p-4 mb-3 rounded-2xl border-l-4 border backdrop-blur-md transition-all duration-300 ${getStatusColor()}`}
     >
+      {/* Header */}
       <div className="flex justify-between items-center mb-3">
         <span className="text-sm font-bold flex items-center gap-2 truncate max-w-[80%]">
-          <Video className="w-4 h-4 text-indigo-400" />
-          {name}
+          <Video className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+          <span className="truncate">{name}</span>
         </span>
         {status === 'processing' ? (
-          <CircleDashed className="w-5 h-5 text-indigo-500 animate-spin" />
+          <CircleDashed className="w-5 h-5 text-indigo-400 animate-spin flex-shrink-0" />
         ) : status === 'done' ? (
-          <CircleCheck className="w-5 h-5 text-emerald-500" />
+          <CircleCheck className="w-5 h-5 text-emerald-400 flex-shrink-0" />
         ) : (
-          <AlertCircle className="w-5 h-5 text-rose-500" />
+          <AlertCircle className="w-5 h-5 text-rose-400 flex-shrink-0" />
         )}
       </div>
 
       {/* Live Logs Terminal */}
       {logs.length > 0 && (
-        <div 
+        <div
           ref={logEndRef}
-          className="bg-black/80 p-3 rounded-lg font-mono text-[11px] max-h-[150px] overflow-y-auto border border-white/5 scrollbar-hide mb-3"
+          className="bg-black/80 p-3 rounded-lg font-mono text-[11px] max-h-[120px] overflow-y-auto border border-white/5 scrollbar-hide mb-3"
         >
           {logs.map((log, i) => (
             <div key={i} className={`mb-1 ${getLogColor(log.type)}`}>
@@ -101,21 +110,33 @@ export default function LinkCard({ id, name, logs, finalLink, status }: LinkCard
         </div>
       )}
 
+      {/* Final Link */}
       <AnimatePresence>
         {finalLink && (
           <motion.div
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
             exit={{ opacity: 0, height: 0 }}
-            className="relative overflow-hidden"
+            className="relative overflow-hidden space-y-2"
           >
-            <div 
+            {/* Copy button */}
+            <div
               onClick={handleCopy}
-              className="w-full bg-emerald-500/10 border border-emerald-500/50 text-emerald-400 py-3 px-4 rounded-xl font-mono text-xs font-bold text-center cursor-pointer hover:bg-emerald-500/20 transition-all flex items-center justify-center gap-2"
+              className="w-full bg-emerald-500/10 border border-emerald-500/40 text-emerald-400 py-3 px-4 rounded-xl font-mono text-xs font-bold cursor-pointer hover:bg-emerald-500/20 transition-all flex items-center justify-between gap-2"
             >
-              <span className="truncate">{copied ? 'COPIED TO CLIPBOARD! ✅' : finalLink}</span>
-              {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+              <span className="truncate flex-1">{copied ? 'COPIED TO CLIPBOARD! ✅' : finalLink}</span>
+              {copied ? <Check className="w-4 h-4 flex-shrink-0" /> : <Copy className="w-4 h-4 flex-shrink-0" />}
             </div>
+            {/* Open link button */}
+            <a
+              href={finalLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full bg-indigo-500/10 border border-indigo-500/30 text-indigo-400 py-2.5 px-4 rounded-xl text-xs font-bold flex items-center justify-center gap-2 hover:bg-indigo-500/20 transition-all"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              Open Download Link
+            </a>
           </motion.div>
         )}
       </AnimatePresence>
