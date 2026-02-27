@@ -1,299 +1,330 @@
-/**
- * /api/cron/process-queue — GITHUB CRON HANDLER (runs every ~1 min)
- *
- * KEY FIX: Uses /api/solve_task (non-streaming, parallel) instead of
- * reading stream_solve. This ensures:
- * 1. ALL links are processed (not just 2)
- * 2. Processing stays within 60s Vercel limit
- * 3. No browser dependency — runs 100% on server
- *
- * Flow:
- *   1. Update heartbeat → shows "ONLINE" in UI
- *   2. Recover stuck tasks (processing > 10 min)
- *   3. Pick 1 pending queue item
- *   4. POST /api/tasks → creates task + extracts links from movie page
- *   5. POST /api/solve_task → solves ALL links in parallel on server
- *   6. Update queue status
- */
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/firebaseAdmin';
+import { extractMovieLinks } from '@/lib/solvers';
+import { TIMER_DOMAINS, STUCK_TASK_THRESHOLD_MS, MAX_CRON_RETRIES } from '@/lib/config';
+// FIX A: Direct import from solve_task — ZERO nested HTTP calls
+import { processLink, saveResultToFirestore } from '@/app/api/solve_task/route';
 
-export const dynamic = 'force-dynamic';
+export const dynamic    = 'force-dynamic';
 export const maxDuration = 60;
 
-import { NextResponse } from 'next/server';
-import { db } from '@/lib/firebaseAdmin';
+const queueCollections = ['movies_queue', 'webseries_queue'] as const;
 
-// ─── Telegram ────────────────────────────────────────────────────────────────
-async function sendTelegram(msg: string) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chat = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chat) return;
+// ─── HELPER: sendTelegram ─────────────────────────────────────────────────────
+async function sendTelegram(msg: string): Promise<void> {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
   try {
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chat, text: msg, parse_mode: 'HTML' }),
+      body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'HTML' }),
     });
-  } catch {}
+  } catch { /* non-critical */ }
 }
 
-// ─── Heartbeat ───────────────────────────────────────────────────────────────
-async function updateHeartbeat(status: 'running' | 'idle' | 'error', details = '') {
+// ─── HELPER: updateHeartbeat ──────────────────────────────────────────────────
+async function updateHeartbeat(
+  status: 'running' | 'idle' | 'error',
+  details?: string,
+): Promise<void> {
   try {
-    await db.collection('system').doc('engine_status').set({
-      lastRunAt: new Date().toISOString(),
-      status, details,
-      source: 'github-cron',
-      updatedAt: new Date().toISOString(),
-    }, { merge: true });
-  } catch (e: any) {
-    console.error('[Heartbeat]', e.message);
-  }
+    await db.collection('system').doc('engine_status').set(
+      {
+        lastRunAt:  new Date().toISOString(),
+        status,
+        details:    details || '',
+        source:     'github-cron',
+        updatedAt:  new Date().toISOString(),
+      },
+      { merge: true },
+    );
+  } catch { /* non-critical */ }
 }
 
-// ─── Stuck task recovery ─────────────────────────────────────────────────────
+// ─── HELPER: recoverStuckTasks ────────────────────────────────────────────────
 async function recoverStuckTasks(): Promise<number> {
-  const TEN_MIN_AGO = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   let recovered = 0;
+  const now = Date.now();
 
-  for (const col of ['movies_queue', 'webseries_queue']) {
+  // A — Queue collections
+  for (const col of queueCollections) {
     try {
-      const stuckSnap = await db.collection(col)
-        .where('status', '==', 'processing')
-        .get();
+      const snap = await db.collection(col).where('status', '==', 'processing').get();
+      for (const doc of snap.docs) {
+        const data      = doc.data();
+        const lockedAt  = data.lockedAt || data.updatedAt || data.createdAt;
+        const lockedMs  = lockedAt ? now - new Date(lockedAt).getTime() : Infinity;
 
-      for (const doc of stuckSnap.docs) {
-        const data = doc.data();
-        const lockedAt = data.lockedAt || data.updatedAt || data.createdAt || '';
-
-        if (lockedAt && lockedAt < TEN_MIN_AGO) {
+        if (lockedMs > STUCK_TASK_THRESHOLD_MS) {
           const retryCount = (data.retryCount || 0) + 1;
-
-          if (retryCount > 3) {
-            await db.collection(col).doc(doc.id).update({
-              status: 'failed',
-              error: 'Max retries exceeded (3/3)',
+          if (retryCount > MAX_CRON_RETRIES) {
+            await doc.ref.update({
+              status:   'failed',
+              error:    `Max retries exceeded ${MAX_CRON_RETRIES}/${MAX_CRON_RETRIES}`,
               failedAt: new Date().toISOString(),
-              retryCount,
             });
           } else {
-            await db.collection(col).doc(doc.id).update({
-              status: 'pending',
-              lockedAt: null,
+            await doc.ref.update({
+              status:            'pending',
+              lockedAt:          null,
               retryCount,
-              lastRecoveredAt: new Date().toISOString(),
+              lastRecoveredAt:   new Date().toISOString(),
             });
           }
           recovered++;
         }
       }
-    } catch (e: any) {
-      console.error(`[Recovery] ${col}:`, e.message);
-    }
+    } catch { /* continue */ }
   }
 
-  // Also recover stuck scraping_tasks
+  // B — scraping_tasks
   try {
-    const stuckSnap = await db.collection('scraping_tasks')
-      .where('status', '==', 'processing')
-      .get();
+    const snap = await db.collection('scraping_tasks').where('status', '==', 'processing').get();
+    for (const doc of snap.docs) {
+      const data      = doc.data();
+      const createdAt = data.createdAt;
+      const ageMs     = createdAt ? now - new Date(createdAt).getTime() : 0;
 
-    for (const doc of stuckSnap.docs) {
-      const data = doc.data();
-      const createdAt = data.createdAt || data.updatedAt || '';
-      if (createdAt && createdAt < TEN_MIN_AGO) {
-        const links = data.links || [];
-        const hasPending = links.some((l: any) => {
-          const s = (l.status || '').toLowerCase();
-          return s === 'pending' || s === 'processing' || s === '';
-        });
+      if (ageMs > STUCK_TASK_THRESHOLD_MS) {
+        const links: any[] = data.links || [];
+        const hasPending   = links.some(l => !l.status || ['pending', 'processing', ''].includes(l.status));
 
         if (hasPending) {
-          const updatedLinks = links.map((l: any) => {
-            const s = (l.status || '').toLowerCase();
-            if (s === 'processing' || s === '' || s === 'pending') {
-              return { ...l, status: 'pending', logs: [{ msg: '🔄 Auto-recovered', type: 'info' }] };
-            }
-            return l;
-          });
-
-          await db.collection('scraping_tasks').doc(doc.id).update({
-            status: 'processing',
-            links: updatedLinks,
-            recoveredAt: new Date().toISOString(),
-          });
+          const resetLinks = links.map(l =>
+            (!l.status || ['pending', 'processing', ''].includes(l.status))
+              ? { ...l, status: 'pending', logs: [...(l.logs || []), { msg: '🔄 Auto-recovered', type: 'info' }] }
+              : l,
+          );
+          await doc.ref.update({ links: resetLinks }); // keep 'processing' — next cron will pick up
           recovered++;
         }
       }
     }
-  } catch (e: any) {
-    console.error('[Recovery] scraping_tasks:', e.message);
-  }
+  } catch { /* continue */ }
 
   return recovered;
 }
 
-// ─── Main Cron Handler ───────────────────────────────────────────────────────
-export async function GET(req: Request) {
-  const auth = req.headers.get('authorization');
-  if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+// ─── GET /api/cron/process-queue ─────────────────────────────────────────────
+export async function GET(req: NextRequest) {
+  // Auth check
+  const cronSecret = process.env.CRON_SECRET;
+  if (cronSecret) {
+    const authHeader = req.headers.get('Authorization') || '';
+    if (authHeader !== `Bearer ${cronSecret}`) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
   }
 
-  const t0 = Date.now();
+  const overallStart = Date.now();
 
   try {
-    // Step 1: Heartbeat
+    // Step 1: Heartbeat → 'running'
     await updateHeartbeat('running', 'Cron started');
 
     // Step 2: Recover stuck tasks
     const recovered = await recoverStuckTasks();
     if (recovered > 0) {
-      await sendTelegram(`🔧 <b>Auto-Recovery</b>\n♻️ ${recovered} stuck task(s) recovered`);
+      await sendTelegram(`🔧 Auto-Recovery\n♻️ ${recovered} stuck task(s) recovered`);
     }
 
-    // Step 3: Pick 1 pending queue item
-    let doc: any = null;
-    let col = '';
+    // Step 3: Pick 1 pending queue item (movies first, then webseries)
+    let item: any = null;
+    let queueCollection = '';
 
-    const mSnap = await db.collection('movies_queue')
-      .where('status', '==', 'pending')
-      .orderBy('createdAt', 'asc')
-      .limit(1)
-      .get();
-
-    if (!mSnap.empty) {
-      doc = mSnap.docs[0];
-      col = 'movies_queue';
-    } else {
-      const wSnap = await db.collection('webseries_queue')
+    for (const col of queueCollections) {
+      const snap = await db
+        .collection(col)
         .where('status', '==', 'pending')
         .orderBy('createdAt', 'asc')
         .limit(1)
         .get();
-      if (!wSnap.empty) {
-        doc = wSnap.docs[0];
-        col = 'webseries_queue';
+
+      if (!snap.empty) {
+        const doc = snap.docs[0];
+        item = { id: doc.id, ...doc.data() };
+        queueCollection = col;
+        break;
       }
     }
 
-    if (!doc) {
+    // Queue empty
+    if (!item) {
       await updateHeartbeat('idle', 'Queue empty');
       return NextResponse.json({ status: 'idle', message: 'Queue empty', recovered });
     }
 
-    const item = { id: doc.id, ...doc.data() } as any;
-    const retryCount = item.retryCount || 0;
-
-    // Step 4: Lock the queue item
-    await db.collection(col).doc(item.id).update({
-      status: 'processing',
-      lockedAt: new Date().toISOString(),
-      retryCount,
+    // Step 4: Lock queue item — direct Firestore (FIX A: no /api/tasks call)
+    await db.collection(queueCollection).doc(item.id).update({
+      status:     'processing',
+      lockedAt:   new Date().toISOString(),
+      retryCount: item.retryCount || 0,
     });
 
-    // Step 5: Get base URL
-    let base = (process.env.NEXT_PUBLIC_BASE_URL || '').replace(/\/$/, '');
-    if (!base) base = 'https://ffgggc-hztr.vercel.app';
-
-    // Step 6: Create task via /api/tasks (extracts links from movie page)
-    console.log(`[Cron] Creating task for: ${item.url}`);
-    const taskRes = await fetch(`${base}/api/tasks`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: item.url }),
-    });
-
-    if (!taskRes.ok) {
-      const errText = await taskRes.text();
-      throw new Error(`/api/tasks HTTP ${taskRes.status}: ${errText.substring(0, 100)}`);
-    }
-
-    const taskData = await taskRes.json();
-    if (taskData.error) throw new Error(taskData.error);
-    const taskId = taskData.taskId;
-
-    // Step 7: Get the task's links from Firebase
-    const taskDoc = await db.collection('scraping_tasks').doc(taskId).get();
-    const taskDocData = taskDoc.exists ? taskDoc.data() : null;
-    const allLinks = taskDocData?.links || [];
-
-    // Filter pending links only
-    const pendingLinks = allLinks
-      .map((l: any, i: number) => ({ ...l, id: i }))
-      .filter((l: any) => {
-        const s = (l.status || '').toLowerCase();
-        return s === 'pending' || s === '' || s === 'processing';
-      });
-
-    let success = false;
-
-    if (pendingLinks.length > 0) {
-      // Step 8: Call /api/solve_task — NON-STREAMING, processes ALL links in parallel
-      console.log(`[Cron] Solving ${pendingLinks.length} links via /api/solve_task`);
-      
-      const solveRes = await fetch(`${base}/api/solve_task`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.CRON_SECRET}`,
-        },
-        body: JSON.stringify({
-          taskId,
-          links: pendingLinks.map((l: any) => ({ id: l.id, name: l.name, link: l.link })),
-          extractedBy: 'Server/Auto-Pilot',
-        }),
-      });
-
-      if (solveRes.ok) {
-        const solveData = await solveRes.json();
-        success = (solveData.done || 0) > 0;
-        console.log(`[Cron] solve_task result: done=${solveData.done}, errors=${solveData.errors}`);
-      } else {
-        const errText = await solveRes.text();
-        console.error(`[Cron] solve_task failed: ${errText.substring(0, 100)}`);
-      }
-    } else {
-      // No pending links (all already done/failed)
-      success = allLinks.some((l: any) => ['done', 'success'].includes((l.status || '').toLowerCase()));
-    }
-
-    // Step 9: Update queue status
-    const finalStatus = success ? 'completed' : 'failed';
-    await db.collection(col).doc(item.id).update({
-      status: finalStatus,
-      processedAt: new Date().toISOString(),
-      taskId,
-      extractedBy: 'Server/Auto-Pilot',
-      retryCount,
-    });
-
-    // Step 10: Mark extraction source on scraping_tasks
+    // Step 5: Extract links directly — direct function call
+    // v4 TRAP 4 FIX: Dedicated try-catch — queue item NEVER permanently locked
+    let listResult: any;
     try {
-      await db.collection('scraping_tasks').doc(taskId).update({
-        extractedBy: 'Server/Auto-Pilot',
+      listResult = await extractMovieLinks(item.url);
+      if (listResult.status !== 'success' || !listResult.links?.length) {
+        throw new Error(listResult.message || 'Link extraction failed or returned 0 links');
+      }
+    } catch (extractionError: any) {
+      // TRAP 8 FIX: Check retries before permanent failure — "one strike you're out" bug fixed
+      const currentRetries = item.retryCount || 0;
+      const isFinalFail = currentRetries >= MAX_CRON_RETRIES;
+
+      await db.collection(queueCollection).doc(item.id).update({
+        status:    isFinalFail ? 'failed' : 'pending', // Re-queue if retries left
+        error:     `Extraction failed: ${extractionError.message}`,
+        failedAt:  isFinalFail ? new Date().toISOString() : null,
+        lockedAt:  null, // Unlock so next cron run can pick it up
+        retryCount: currentRetries + 1,
       });
-    } catch {}
 
-    // Step 11: Heartbeat & Telegram
-    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    const title = taskData.preview?.title || item.title || item.url;
+      // Re-throw — top-level catch sends Telegram alert
+      throw extractionError;
+    }
 
-    await updateHeartbeat('idle', `Last: ${title} (${finalStatus})`);
+    // FIX D: Stable IDs assigned at extraction time
+    const linksWithIds = listResult.links.map((l: any, i: number) => ({
+      ...l,
+      id:     i,          // stable originalIndex
+      status: 'pending',
+      logs:   [{ msg: '🔍 Queued for processing...', type: 'info' }],
+    }));
 
-    await sendTelegram(success
-      ? `✅ <b>Auto-Pilot</b> 🤖\n🎬 ${title}\n⏱ ${elapsed}s\n🔄 Retry: ${retryCount}/3`
-      : `❌ <b>Auto-Pilot Failed</b>\n🎬 ${title}\n🔄 Retry: ${retryCount}/3`
+    // FIX A: Direct Firestore write — no /api/tasks HTTP call
+    // v4 TRAP 1 FIX: completedLinksCount: 0 initialized
+    const taskRef = await db.collection('scraping_tasks').add({
+      url:                 item.url,
+      status:              'processing',
+      createdAt:           new Date().toISOString(),
+      extractedBy:         'Server/Auto-Pilot',
+      metadata:            listResult.metadata || null,
+      preview:             listResult.preview  || null,
+      links:               linksWithIds,
+      completedLinksCount: 0, // v4 TRAP 1: atomic increment counter initialized
+    });
+    const taskId = taskRef.id;
+
+    // Step 6: Filter pending links
+    const pendingLinks = linksWithIds.filter(
+      (l: any) => !l.status || ['pending', 'processing'].includes(l.status),
     );
 
-    return NextResponse.json({
-      status: finalStatus, title, elapsed, recovered, retryCount,
-      extractedBy: 'Server/Auto-Pilot',
-    });
+    // Step 7: Solve links — direct function calls (FIX A: no /api/solve_task call)
+    // v5 TRAP 6 FIX: Track deferred links
+    const TIME_BUDGET_MS = 45_000;
+    let hasDeferredLinks = false; // v5 TRAP 6
 
-  } catch (e: any) {
-    console.error(`[CRON ERROR]`, e);
-    await updateHeartbeat('error', e.message);
-    await sendTelegram(`🚨 <b>CRON ERROR</b>\n${e.message}`);
-    return NextResponse.json({ error: e.message, status: 'failed_internally' }, { status: 200 });
+    const timerLinks  = pendingLinks.filter((l: any) => TIMER_DOMAINS.some(d => l.link?.includes(d)));
+    const directLinks = pendingLinks.filter((l: any) => !TIMER_DOMAINS.some(d => l.link?.includes(d)));
+
+    // Direct links — parallel
+    const directPromises = directLinks.map((l: any) =>
+      processLink(l, l.id, taskId, 'Server/Auto-Pilot'), // FIX D: l.id
+    );
+
+    // Timer links — sequential with time budget (FIX C — index-based)
+    // TRAP 7 FIX: Collect + RETURN results so timerDone is counted correctly
+    const timerPromise: Promise<any[]> = (async () => {
+      const timerResults: any[] = [];
+
+      for (let i = 0; i < timerLinks.length; i++) {
+        const l = timerLinks[i];
+
+        if (Date.now() - overallStart > TIME_BUDGET_MS) {
+          hasDeferredLinks = true; // v5 TRAP 6: SET FLAG before deferred saves
+
+          // v4 TRAP 3 FIX: Promise.all — parallel deferred saves
+          await Promise.all(
+            timerLinks.slice(i).map((deferred: any) =>
+              saveResultToFirestore(taskId, deferred.id, deferred.link, {
+                status:    'pending',
+                error:     null,
+                finalLink: null,
+                logs: [{ msg: '⏳ Time budget exceeded — deferred to next cron run', type: 'warn' }],
+              }, 'Server/Auto-Pilot'),
+            ),
+          );
+          break;
+        }
+
+        const r = await processLink(l, l.id, taskId, 'Server/Auto-Pilot'); // FIX D: l.id
+        timerResults.push(r);
+      }
+
+      return timerResults;
+    })();
+
+    const [directSettled, timerResults] = await Promise.all([
+      Promise.allSettled(directPromises),
+      timerPromise,
+    ]);
+
+    // TRAP 7 FIX: Count successes from BOTH arrays correctly — timer results were previously IGNORED
+    const directDone = directSettled.filter(r => r.status === 'fulfilled' && (r.value as any)?.status === 'done').length;
+    const timerDone  = (timerResults as any[]).filter(r => r?.status === 'done' || r?.status === 'success').length;
+    const doneCount  = directDone + timerDone;
+
+    // Step 8: Queue item status update (FIX A + v5 TRAP 6 FIX)
+    // v5 TRAP 6 FIX: hasDeferredLinks → queue 'pending' + unlock for next cron run
+    if (hasDeferredLinks) {
+      await db.collection(queueCollection).doc(item.id).update({
+        status:           'pending',   // Re-queue — next cron will resume
+        lockedAt:         null,        // Unlock
+        taskId,
+        extractedBy:      'Server/Auto-Pilot',
+        retryCount:       item.retryCount || 0,
+        lastPartialRunAt: new Date().toISOString(),
+      });
+    } else {
+      await db.collection(queueCollection).doc(item.id).update({
+        status:      doneCount > 0 ? 'completed' : 'failed',
+        processedAt: new Date().toISOString(),
+        taskId,
+        extractedBy: 'Server/Auto-Pilot',
+        retryCount:  item.retryCount || 0,
+      });
+    }
+
+    // Step 9: Heartbeat → 'idle'
+    await updateHeartbeat('idle', 'Queue run complete');
+
+    // Step 10: Telegram notification
+    const elapsed = Math.round((Date.now() - overallStart) / 1000);
+    const title   = listResult.metadata?.title || item.url;
+    const retry   = item.retryCount || 0;
+
+    if (hasDeferredLinks) {
+      await sendTelegram(
+        `⏳ Auto-Pilot Partial 🤖\n🎬 ${title}\n⏱ ${elapsed}s\n🔗 Deferred links pending — next run will resume\n🔄 Retry: ${retry}/${MAX_CRON_RETRIES}`,
+      );
+    } else if (doneCount > 0) {
+      await sendTelegram(
+        `✅ Auto-Pilot 🤖\n🎬 ${title}\n⏱ ${elapsed}s\n🔄 Retry: ${retry}/${MAX_CRON_RETRIES}`,
+      );
+    } else {
+      await sendTelegram(
+        `❌ Auto-Pilot Failed\n🎬 ${title}\n🔄 Retry: ${retry}/${MAX_CRON_RETRIES}`,
+      );
+    }
+
+    return NextResponse.json({
+      status:       'ok',
+      taskId,
+      recovered,
+      doneCount,
+      hasDeferredLinks,
+      elapsed,
+    });
+  } catch (err: any) {
+    // Return 200 — GitHub Actions 500 causes job failure + unnecessary retries
+    await updateHeartbeat('error', err.message);
+    await sendTelegram(`🚨 Cron Error\n${err.message}`);
+    return NextResponse.json({ status: 'error', error: err.message });
   }
 }
