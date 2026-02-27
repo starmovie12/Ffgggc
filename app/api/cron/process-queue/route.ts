@@ -1,12 +1,28 @@
+/**
+ * /api/cron/process-queue — GITHUB CRON HANDLER (runs every ~1 min)
+ *
+ * KEY FIX: Uses /api/solve_task (non-streaming, parallel) instead of
+ * reading stream_solve. This ensures:
+ * 1. ALL links are processed (not just 2)
+ * 2. Processing stays within 60s Vercel limit
+ * 3. No browser dependency — runs 100% on server
+ *
+ * Flow:
+ *   1. Update heartbeat → shows "ONLINE" in UI
+ *   2. Recover stuck tasks (processing > 10 min)
+ *   3. Pick 1 pending queue item
+ *   4. POST /api/tasks → creates task + extracts links from movie page
+ *   5. POST /api/solve_task → solves ALL links in parallel on server
+ *   6. Update queue status
+ */
+
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/firebaseAdmin';
 
-// ============================================================================
-// TELEGRAM HELPER
-// ============================================================================
+// ─── Telegram ────────────────────────────────────────────────────────────────
 async function sendTelegram(msg: string) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chat = process.env.TELEGRAM_CHAT_ID;
@@ -20,28 +36,23 @@ async function sendTelegram(msg: string) {
   } catch {}
 }
 
-// ============================================================================
-// HEARTBEAT: Update engine status in Firebase every cron run
-// ============================================================================
-async function updateHeartbeat(status: 'running' | 'idle' | 'error', details?: string) {
+// ─── Heartbeat ───────────────────────────────────────────────────────────────
+async function updateHeartbeat(status: 'running' | 'idle' | 'error', details = '') {
   try {
     await db.collection('system').doc('engine_status').set({
       lastRunAt: new Date().toISOString(),
-      status,
-      details: details || '',
+      status, details,
       source: 'github-cron',
       updatedAt: new Date().toISOString(),
     }, { merge: true });
   } catch (e: any) {
-    console.error('[Heartbeat] Failed to update:', e.message);
+    console.error('[Heartbeat]', e.message);
   }
 }
 
-// ============================================================================
-// STUCK TASK RECOVERY: Reset tasks stuck in "processing" for 10+ minutes
-// ============================================================================
+// ─── Stuck task recovery ─────────────────────────────────────────────────────
 async function recoverStuckTasks(): Promise<number> {
-  const TEN_MINUTES_AGO = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const TEN_MIN_AGO = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   let recovered = 0;
 
   for (const col of ['movies_queue', 'webseries_queue']) {
@@ -54,46 +65,42 @@ async function recoverStuckTasks(): Promise<number> {
         const data = doc.data();
         const lockedAt = data.lockedAt || data.updatedAt || data.createdAt || '';
 
-        if (lockedAt && lockedAt < TEN_MINUTES_AGO) {
+        if (lockedAt && lockedAt < TEN_MIN_AGO) {
           const retryCount = (data.retryCount || 0) + 1;
 
           if (retryCount > 3) {
             await db.collection(col).doc(doc.id).update({
               status: 'failed',
-              error: 'Max retries exceeded (3/3) — task timed out repeatedly',
+              error: 'Max retries exceeded (3/3)',
               failedAt: new Date().toISOString(),
               retryCount,
             });
-            recovered++;
-            console.log(`[Recovery] FAILED (max retries): ${doc.id} in ${col}`);
           } else {
             await db.collection(col).doc(doc.id).update({
               status: 'pending',
               lockedAt: null,
               retryCount,
               lastRecoveredAt: new Date().toISOString(),
-              recoveryNote: `Auto-recovered from stuck processing (attempt ${retryCount}/3)`,
             });
-            recovered++;
-            console.log(`[Recovery] Reset to pending: ${doc.id} in ${col} (retry ${retryCount}/3)`);
           }
+          recovered++;
         }
       }
     } catch (e: any) {
-      console.error(`[Recovery] Error scanning ${col}:`, e.message);
+      console.error(`[Recovery] ${col}:`, e.message);
     }
   }
 
   // Also recover stuck scraping_tasks
   try {
-    const stuckTasksSnap = await db.collection('scraping_tasks')
+    const stuckSnap = await db.collection('scraping_tasks')
       .where('status', '==', 'processing')
       .get();
 
-    for (const doc of stuckTasksSnap.docs) {
+    for (const doc of stuckSnap.docs) {
       const data = doc.data();
       const createdAt = data.createdAt || data.updatedAt || '';
-      if (createdAt && createdAt < TEN_MINUTES_AGO) {
+      if (createdAt && createdAt < TEN_MIN_AGO) {
         const links = data.links || [];
         const hasPending = links.some((l: any) => {
           const s = (l.status || '').toLowerCase();
@@ -103,8 +110,8 @@ async function recoverStuckTasks(): Promise<number> {
         if (hasPending) {
           const updatedLinks = links.map((l: any) => {
             const s = (l.status || '').toLowerCase();
-            if (s === 'processing') {
-              return { ...l, status: 'pending', logs: [{ msg: '🔄 Auto-recovered from timeout', type: 'info' }] };
+            if (s === 'processing' || s === '' || s === 'pending') {
+              return { ...l, status: 'pending', logs: [{ msg: '🔄 Auto-recovered', type: 'info' }] };
             }
             return l;
           });
@@ -119,15 +126,13 @@ async function recoverStuckTasks(): Promise<number> {
       }
     }
   } catch (e: any) {
-    console.error('[Recovery] Error scanning scraping_tasks:', e.message);
+    console.error('[Recovery] scraping_tasks:', e.message);
   }
 
   return recovered;
 }
 
-// ============================================================================
-// MAIN CRON HANDLER
-// ============================================================================
+// ─── Main Cron Handler ───────────────────────────────────────────────────────
 export async function GET(req: Request) {
   const auth = req.headers.get('authorization');
   if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -137,16 +142,16 @@ export async function GET(req: Request) {
   const t0 = Date.now();
 
   try {
-    // ── Step 1: Update Heartbeat ──
-    await updateHeartbeat('running', 'Cron job started');
+    // Step 1: Heartbeat
+    await updateHeartbeat('running', 'Cron started');
 
-    // ── Step 2: Recover Stuck Tasks ──
+    // Step 2: Recover stuck tasks
     const recovered = await recoverStuckTasks();
     if (recovered > 0) {
       await sendTelegram(`🔧 <b>Auto-Recovery</b>\n♻️ ${recovered} stuck task(s) recovered`);
     }
 
-    // ── Step 3: Pick 1 pending item ──
+    // Step 3: Pick 1 pending queue item
     let doc: any = null;
     let col = '';
 
@@ -172,33 +177,26 @@ export async function GET(req: Request) {
     }
 
     if (!doc) {
-      await updateHeartbeat('idle', 'Queue empty — nothing to process');
-      return NextResponse.json({ status: 'idle', message: 'Queue empty', recovered, heartbeat: 'updated' });
+      await updateHeartbeat('idle', 'Queue empty');
+      return NextResponse.json({ status: 'idle', message: 'Queue empty', recovered });
     }
 
     const item = { id: doc.id, ...doc.data() } as any;
     const retryCount = item.retryCount || 0;
 
-    // ── Step 4: Lock the task ──
+    // Step 4: Lock the queue item
     await db.collection(col).doc(item.id).update({
       status: 'processing',
       lockedAt: new Date().toISOString(),
       retryCount,
     });
 
-    // ── FIX 1: Ensure base URL is clean without trailing slash ──
-    let base = process.env.NEXT_PUBLIC_BASE_URL || '';
-    if (base.endsWith('/')) {
-        base = base.slice(0, -1);
-    }
-    
-    // Fallback if env variable is missing
-    if (!base) {
-        base = 'https://ffgggc-hztr.vercel.app';
-    }
+    // Step 5: Get base URL
+    let base = (process.env.NEXT_PUBLIC_BASE_URL || '').replace(/\/$/, '');
+    if (!base) base = 'https://ffgggc-hztr.vercel.app';
 
-    // ── Step 5: Create task via /api/tasks ──
-    console.log(`[Engine] Calling ${base}/api/tasks for URL: ${item.url}`);
+    // Step 6: Create task via /api/tasks (extracts links from movie page)
+    console.log(`[Cron] Creating task for: ${item.url}`);
     const taskRes = await fetch(`${base}/api/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -206,77 +204,60 @@ export async function GET(req: Request) {
     });
 
     if (!taskRes.ok) {
-        // Log the exact text returned to know why it failed
-        const errText = await taskRes.text();
-        console.error(`[Engine] Task Creation Failed:`, errText);
-        throw new Error(`/api/tasks HTTP ${taskRes.status}: ${errText.substring(0, 50)}`);
+      const errText = await taskRes.text();
+      throw new Error(`/api/tasks HTTP ${taskRes.status}: ${errText.substring(0, 100)}`);
     }
-    
+
     const taskData = await taskRes.json();
     if (taskData.error) throw new Error(taskData.error);
-
     const taskId = taskData.taskId;
 
-    // ── Step 6: Fetch and solve links ──
-    const listRes = await fetch(`${base}/api/tasks`);
-    const taskList = await listRes.json();
-    const newTask = Array.isArray(taskList) ? taskList.find((t: any) => t.id === taskId) : null;
+    // Step 7: Get the task's links from Firebase
+    const taskDoc = await db.collection('scraping_tasks').doc(taskId).get();
+    const taskDocData = taskDoc.exists ? taskDoc.data() : null;
+    const allLinks = taskDocData?.links || [];
+
+    // Filter pending links only
+    const pendingLinks = allLinks
+      .map((l: any, i: number) => ({ ...l, id: i }))
+      .filter((l: any) => {
+        const s = (l.status || '').toLowerCase();
+        return s === 'pending' || s === '' || s === 'processing';
+      });
 
     let success = false;
-    if (newTask?.links?.length > 0) {
-      const pending = newTask.links
-        .map((l: any, i: number) => ({ ...l, _idx: i }))
-        .filter((l: any) => {
-          const s = (l.status || '').toLowerCase();
-          return s === 'pending' || s === '' || s === 'processing';
-        });
 
-      if (pending.length > 0) {
-        const solveRes = await fetch(`${base}/api/stream_solve`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            links: pending.map((l: any) => ({ id: l._idx, name: l.name, link: l.link })),
-            taskId,
-            extractedBy: 'Server/Auto-Pilot',
-          }),
-        });
+    if (pendingLinks.length > 0) {
+      // Step 8: Call /api/solve_task — NON-STREAMING, processes ALL links in parallel
+      console.log(`[Cron] Solving ${pendingLinks.length} links via /api/solve_task`);
+      
+      const solveRes = await fetch(`${base}/api/solve_task`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.CRON_SECRET}`,
+        },
+        body: JSON.stringify({
+          taskId,
+          links: pendingLinks.map((l: any) => ({ id: l.id, name: l.name, link: l.link })),
+          extractedBy: 'Server/Auto-Pilot',
+        }),
+      });
 
-        if (solveRes.ok && solveRes.body) {
-          const reader = solveRes.body.getReader();
-          const dec = new TextDecoder();
-          let buf = '', ok = 0;
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buf += dec.decode(value, { stream: true });
-            const lines = buf.split('\n');
-            buf = lines.pop() || '';
-            for (const l of lines) {
-              try {
-                // FIX 2: Safely parse JSON lines
-                if (l.trim() !== '') {
-                    const d = JSON.parse(l);
-                    if (d.status === 'done' || d.status === 'success') ok++;
-                }
-              } catch (parseErr) {
-                  // Ignore parse errors on partial streams
-              }
-            }
-          }
-          // Consider it a success if at least one link was extracted
-          success = ok > 0;
-        } else {
-             console.error(`[Engine] Stream Solve Failed with status: ${solveRes.status}`);
-        }
+      if (solveRes.ok) {
+        const solveData = await solveRes.json();
+        success = (solveData.done || 0) > 0;
+        console.log(`[Cron] solve_task result: done=${solveData.done}, errors=${solveData.errors}`);
       } else {
-        success = true;
+        const errText = await solveRes.text();
+        console.error(`[Cron] solve_task failed: ${errText.substring(0, 100)}`);
       }
     } else {
-         console.log(`[Engine] No links found for task ID: ${taskId}`);
+      // No pending links (all already done/failed)
+      success = allLinks.some((l: any) => ['done', 'success'].includes((l.status || '').toLowerCase()));
     }
 
-    // ── Step 7: Update queue status ──
+    // Step 9: Update queue status
     const finalStatus = success ? 'completed' : 'failed';
     await db.collection(col).doc(item.id).update({
       status: finalStatus,
@@ -286,14 +267,14 @@ export async function GET(req: Request) {
       retryCount,
     });
 
-    // ── Step 8: Mark extraction source on scraping_tasks ──
+    // Step 10: Mark extraction source on scraping_tasks
     try {
       await db.collection('scraping_tasks').doc(taskId).update({
         extractedBy: 'Server/Auto-Pilot',
       });
     } catch {}
 
-    // ── Step 9: Update Heartbeat ──
+    // Step 11: Heartbeat & Telegram
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     const title = taskData.preview?.title || item.title || item.url;
 
@@ -306,17 +287,13 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       status: finalStatus, title, elapsed, recovered, retryCount,
-      extractedBy: 'Server/Auto-Pilot', heartbeat: 'updated',
+      extractedBy: 'Server/Auto-Pilot',
     });
 
   } catch (e: any) {
-    // FIX 3: Detailed error reporting
     console.error(`[CRON ERROR]`, e);
     await updateHeartbeat('error', e.message);
     await sendTelegram(`🚨 <b>CRON ERROR</b>\n${e.message}`);
-    
-    // We still return 200 to GitHub so it doesn't think the webhook itself is broken
-    // The task logic will be retried in the next 5 mins
-    return NextResponse.json({ error: e.message, status: "failed_internally" }, { status: 200 });
+    return NextResponse.json({ error: e.message, status: 'failed_internally' }, { status: 200 });
   }
 }
