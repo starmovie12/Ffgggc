@@ -1,80 +1,73 @@
-export const dynamic = 'force-dynamic';
-
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/firebaseAdmin';
 
+export const dynamic = 'force-dynamic';
+
 export async function GET() {
   try {
-    const doc = await db.collection('system').doc('engine_status').get();
+    const snap = await db.collection('system').doc('engine_status').get();
 
-    if (!doc.exists) {
+    if (!snap.exists) {
       return NextResponse.json({
-        status: 'unknown',
-        signal: 'OFFLINE',
-        lastRunAt: null,
-        details: 'No heartbeat data found',
+        status:           'unknown',
+        signal:           'OFFLINE',
+        lastRunAt:        null,
+        details:          'No heartbeat data found',
         backgroundActive: false,
       });
     }
 
-    const data = doc.data()!;
-    const lastRunAt = data.lastRunAt || null;
-    const now = new Date();
-    const lastRun = lastRunAt ? new Date(lastRunAt) : null;
+    const data    = snap.data()!;
+    const lastRunAt: string | null = data.lastRunAt || null;
 
-    // Engine is ONLINE if it ran within the last 10 minutes
+    const now        = Date.now();
+    const lastRun    = lastRunAt ? new Date(lastRunAt).getTime() : null;
     const TEN_MINUTES = 10 * 60 * 1000;
-    const isOnline = lastRun ? (now.getTime() - lastRun.getTime()) < TEN_MINUTES : false;
+    const isOnline   = lastRun ? (now - lastRun < TEN_MINUTES) : false;
 
-    // Calculate time since last run
-    let timeSinceLastRun = '';
+    // Human-readable time since last run
+    let timeSinceLastRun = 'Unknown';
     if (lastRun) {
-      const diffMs = now.getTime() - lastRun.getTime();
-      const diffMin = Math.floor(diffMs / 60000);
-      const diffSec = Math.floor((diffMs % 60000) / 1000);
-      if (diffMin > 60) {
-        const diffHr = Math.floor(diffMin / 60);
-        timeSinceLastRun = `${diffHr}h ${diffMin % 60}m ago`;
-      } else if (diffMin > 0) {
-        timeSinceLastRun = `${diffMin}m ${diffSec}s ago`;
-      } else {
+      const diffMs  = now - lastRun;
+      const diffSec = Math.floor(diffMs / 1000);
+      const diffMin = Math.floor(diffSec / 60);
+      const diffHr  = Math.floor(diffMin / 60);
+
+      if (diffSec < 60) {
         timeSinceLastRun = `${diffSec}s ago`;
+      } else if (diffMin < 60) {
+        timeSinceLastRun = `${diffMin}m ${diffSec % 60}s ago`;
+      } else {
+        timeSinceLastRun = `${diffHr}h ${diffMin % 60}m ago`;
       }
     }
 
-    // Check pending queue count
-    let pendingCount = 0;
-    try {
-      const mSnap = await db.collection('movies_queue').where('status', '==', 'pending').get();
-      const wSnap = await db.collection('webseries_queue').where('status', '==', 'pending').get();
-      pendingCount = mSnap.size + wSnap.size;
-    } catch {}
+    // Queue counts
+    const [moviesPending, webseriesPending, moviesProcessing, webseriesProcessing] =
+      await Promise.all([
+        db.collection('movies_queue').where('status', '==', 'pending').get(),
+        db.collection('webseries_queue').where('status', '==', 'pending').get(),
+        db.collection('movies_queue').where('status', '==', 'processing').get(),
+        db.collection('webseries_queue').where('status', '==', 'processing').get(),
+      ]);
 
-    // Check processing count
-    let processingCount = 0;
-    try {
-      const mProcSnap = await db.collection('movies_queue').where('status', '==', 'processing').get();
-      const wProcSnap = await db.collection('webseries_queue').where('status', '==', 'processing').get();
-      processingCount = mProcSnap.size + wProcSnap.size;
-    } catch {}
+    const pendingCount    = moviesPending.size    + webseriesPending.size;
+    const processingCount = moviesProcessing.size + webseriesProcessing.size;
+
+    const backgroundActive = isOnline && (pendingCount > 0 || processingCount > 0);
 
     return NextResponse.json({
-      status: data.status || 'unknown',
-      signal: isOnline ? 'ONLINE' : 'OFFLINE',
+      status:           data.status || 'unknown',
+      signal:           isOnline ? 'ONLINE' : 'OFFLINE',
       lastRunAt,
       timeSinceLastRun,
-      details: data.details || '',
-      source: data.source || 'unknown',
-      backgroundActive: isOnline && (pendingCount > 0 || processingCount > 0),
+      details:          data.details || '',
+      source:           data.source  || 'unknown',
+      backgroundActive,
       pendingCount,
       processingCount,
     });
-  } catch (e: any) {
-    return NextResponse.json({
-      status: 'error',
-      signal: 'OFFLINE',
-      error: e.message,
-      backgroundActive: false,
-    }, { status: 500 });
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
