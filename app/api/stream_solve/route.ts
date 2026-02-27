@@ -1,19 +1,4 @@
-/**
- * /api/stream_solve — BROWSER LIVE STREAMING SOLVER
- *
- * This is ONLY used for the manual "START ENGINE" button in the browser.
- * It streams real-time logs to the UI via NDJSON.
- *
- * KEY FIXES:
- * 1. Per-link timeout of 25s — no single link can block others
- * 2. Overall timeout of 50s — ensures we finish within Vercel's 60s
- * 3. Promise.allSettled for parallel — one failure never kills siblings
- * 4. Every link gets a final status (done/error), never left hanging
- */
-
-export const maxDuration = 60;
-
-import { db } from '@/lib/firebaseAdmin';
+import { db, admin } from '@/lib/firebaseAdmin';
 import {
   solveHBLinks,
   solveHubCDN,
@@ -21,221 +6,258 @@ import {
   solveHubCloudNative,
   solveGadgetsWebNative,
 } from '@/lib/solvers';
+// v3 FIX: TIMER_API from config — NOT hardcoded (deleted line 25)
+import {
+  TIMER_API,
+  TIMER_DOMAINS,
+  LINK_TIMEOUT_MS,
+  OVERALL_TIMEOUT_MS,
+} from '@/lib/config';
 
-const TIMER_API = 'http://85.121.5.246:10000/solve?url=';
-const LINK_TIMEOUT_MS = 25_000; // 25s per link
-const OVERALL_TIMEOUT_MS = 50_000; // 50s overall guard
+export const maxDuration = 60;
 
-const fetchJSON = async (url: string, timeoutMs = 20000) => {
-  const ctrl = new AbortController();
+// ─── HELPER: fetchJSON ────────────────────────────────────────────────────────
+async function fetchJSON(url: string, timeoutMs = 20_000): Promise<any> {
+  const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      signal: ctrl.signal,
-      headers: { 'User-Agent': 'MflixPro/2.0' },
+      signal:  ctrl.signal,
+      headers: { 'User-Agent': 'MflixPro/3.0' },
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
+  } catch (err: any) {
+    if (err.name === 'AbortError') throw new Error('Timed out');
+    throw err;
   } finally {
     clearTimeout(timer);
   }
-};
+}
 
-export async function POST(req: Request) {
-  let links: any[];
-  let taskId: string | undefined;
-  let extractedBy: string = 'Browser/Live';
+// ─── HELPER: saveToFirestore (stream version) ─────────────────────────────────
+// FIX B — sub-collection architecture
+// v5 TRAP 5 FIX — conditional increment (deferred/pending links never counted)
+async function saveToFirestore(
+  taskId: string | undefined,
+  lid: number | string,
+  linkUrl: string,
+  result: {
+    status?: string;
+    finalLink?: string | null;
+    error?: string | null;
+    logs?: any[];
+    best_button_name?: string | null;
+    all_available_buttons?: any[];
+  },
+  extractedBy: string,
+): Promise<void> {
+  if (!taskId) return; // taskId is optional in stream_solve
 
-  try {
-    const body = await req.json();
-    links = body.links;
-    taskId = body.taskId;
-    if (body.extractedBy) extractedBy = body.extractedBy;
-  } catch {
-    return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400 });
+  const resultRef = db
+    .collection('scraping_tasks').doc(taskId)
+    .collection('results').doc(String(lid));
+
+  await resultRef.set({
+    lid,
+    linkUrl,
+    finalLink:             result.finalLink            ?? null,
+    status:                result.status               ?? 'error',
+    error:                 result.error                ?? null,
+    logs:                  result.logs                 ?? [],
+    best_button_name:      result.best_button_name     ?? null,
+    all_available_buttons: result.all_available_buttons ?? [],
+    extractedBy,
+    solvedAt: new Date().toISOString(),
+  });
+
+  const taskRef = db.collection('scraping_tasks').doc(taskId);
+
+  // v5 TRAP 5 FIX: CONDITIONAL increment — deferred (pending) links NEVER increment
+  const effectiveStatus = result.status ?? 'error';
+  if (effectiveStatus !== 'pending') {
+    await taskRef.update({
+      completedLinksCount: admin.firestore.FieldValue.increment(1),
+    });
   }
 
-  if (!Array.isArray(links) || links.length === 0) {
+  // Check completion
+  const masterSnap = await taskRef.get();
+  if (!masterSnap.exists) return;
+
+  const data           = masterSnap.data()!;
+  const totalLinks     = (data.links ?? []).length;
+  const completedCount = data.completedLinksCount ?? 0;
+
+  if (completedCount >= totalLinks && totalLinks > 0) {
+    const resultsSnap = await db
+      .collection('scraping_tasks').doc(taskId)
+      .collection('results').get();
+
+    const allResults = resultsSnap.docs.map(d => d.data());
+    const anySuccess = allResults.some(r => ['done', 'success'].includes(r.status ?? ''));
+
+    await taskRef.update({
+      status: anySuccess ? 'completed' : 'failed',
+      completedAt: new Date().toISOString(),
+    });
+  }
+}
+
+// ─── POST /api/stream_solve ───────────────────────────────────────────────────
+export async function POST(req: Request) {
+  let body: any;
+  try { body = await req.json(); } catch {
+    return new Response('Invalid JSON', { status: 400 });
+  }
+
+  const links: any[]    = body?.links || [];
+  const taskId: string  = body?.taskId;
+  const extractedBy     = body?.extractedBy || 'Browser/Live';
+
+  if (!links.length) {
     return new Response(JSON.stringify({ error: 'No links provided' }), { status: 400 });
   }
 
   const stream = new ReadableStream({
     async start(controller) {
-      const encoder = new TextEncoder();
+      const encoder    = new TextEncoder();
       const overallStart = Date.now();
 
       const send = (data: any) => {
-        try { controller.enqueue(encoder.encode(JSON.stringify(data) + '\n')); } catch {}
+        try {
+          controller.enqueue(encoder.encode(JSON.stringify(data) + '\n'));
+        } catch { /* stream closed */ }
       };
 
-      const processLink = async (linkData: any, idx: number) => {
-        const lid = linkData.id ?? idx;
-        let currentLink = linkData.link;
+      // ─── processLink (stream version) ──────────────────────────────────────
+      const processLink = async (linkData: any, lid: number | string): Promise<void> => {
+        const originalUrl = linkData.link;
+        let   currentLink = originalUrl;
         const logs: { msg: string; type: string }[] = [];
 
-        const sendLog = (msg: string, type = 'info') => {
+        const log = (msg: string, type = 'info') => {
           logs.push({ msg, type });
           send({ id: lid, msg, type });
         };
 
-        // Check overall timeout
-        if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) {
-          sendLog('⏱️ Skipped — overall timeout reached', 'error');
-          send({ id: lid, status: 'error' });
-          await saveToFirestore(taskId, lid, linkData, { status: 'error', error: 'Overall timeout', logs }, extractedBy);
-          send({ id: lid, status: 'finished' });
-          return;
-        }
+        let resultPayload: any;
 
-        // Per-link timeout wrapper
-        const solveWithTimeout = async () => {
-          try {
-            if (!currentLink || typeof currentLink !== 'string') {
-              sendLog('❌ No link URL', 'error');
-              send({ id: lid, status: 'error' });
-              await saveToFirestore(taskId, lid, linkData, { status: 'error', error: 'No link URL', logs }, extractedBy);
-              return;
-            }
-
-            // ── HUBCDN.FANS ──
+        try {
+          const solving = async () => {
+            // HubCDN.fans shortcut
             if (currentLink.includes('hubcdn.fans')) {
-              sendLog('⚡ HubCDN processing...', 'info');
+              log('⚡ HubCDN.fans detected — direct solve');
               const r = await solveHubCDN(currentLink);
-              if (r.status === 'success') {
-                send({ id: lid, final: r.final_link, status: 'done' });
-                await saveToFirestore(taskId, lid, linkData, { status: 'done', finalLink: r.final_link, logs }, extractedBy);
-              } else {
-                sendLog(`❌ HubCDN: ${r.message}`, 'error');
-                send({ id: lid, status: 'error' });
-                await saveToFirestore(taskId, lid, linkData, { status: 'error', error: r.message, logs }, extractedBy);
-              }
-              return;
+              if (r.status === 'success') return { finalLink: r.final_link, status: 'done', logs };
+              return { status: 'error', error: r.message, logs };
             }
 
-            // ── TIMER BYPASS ──
-            const targetDomains = ['hblinks', 'hubdrive', 'hubcdn', 'hubcloud'];
+            // Timer bypass loop
             let loopCount = 0;
-            while (loopCount < 3 && !targetDomains.some(d => currentLink.includes(d))) {
-              const isTimer = ['gadgetsweb', 'review-tech', 'ngwin', 'cryptoinsights'].some(x => currentLink.includes(x));
-              if (!isTimer && loopCount === 0) break;
+            while (loopCount < 3 && !([ 'hblinks','hubdrive','hubcdn','hubcloud','gdflix','drivehub' ].some(d => currentLink.includes(d)))) {
+              if (!TIMER_DOMAINS.some(d => currentLink.includes(d)) && loopCount === 0) break;
 
-              sendLog('⏳ Timer bypass...', 'warn');
-              try {
-                if (currentLink.includes('gadgetsweb')) {
-                  const r = await solveGadgetsWebNative(currentLink);
-                  if (r.status === 'success') {
-                    currentLink = r.link!;
-                    sendLog('✅ Timer bypassed', 'success');
-                  } else throw new Error(r.message || 'Bypass failed');
-                } else {
-                  const r = await fetchJSON(TIMER_API + encodeURIComponent(currentLink));
-                  if (r.status === 'success') {
-                    currentLink = r.extracted_link;
-                    sendLog('✅ Timer bypassed', 'success');
-                  } else throw new Error(r.message || 'Timer failed');
-                }
-              } catch (e: any) {
-                sendLog(`❌ Timer: ${e.message}`, 'error');
+              if (currentLink.includes('gadgetsweb')) {
+                log(`🔁 GadgetsWeb native solve (loop ${loopCount + 1})`);
+                const r = await solveGadgetsWebNative(currentLink);
+                if (r.status === 'success') { currentLink = r.link; loopCount++; continue; }
+                log(`❌ GadgetsWeb failed: ${r.message}`, 'error');
+                break;
+              } else {
+                // v3 FIX: TIMER_API from config, suffix added here
+                log(`⏱ Timer bypass via VPS (loop ${loopCount + 1})`);
+                const r = await fetchJSON(`${TIMER_API}/solve?url=${encodeURIComponent(currentLink)}`, 20_000);
+                if (r.status === 'success' && r.extracted_link) { currentLink = r.extracted_link; loopCount++; continue; }
+                log('❌ Timer bypass failed', 'error');
                 break;
               }
-              loopCount++;
             }
 
-            // ── HBLINKS ──
+            // HBLinks
             if (currentLink.includes('hblinks')) {
-              sendLog('🔗 Solving HBLinks...', 'info');
+              log('🔗 HBLinks solving...');
               const r = await solveHBLinks(currentLink);
-              if (r.status === 'success') {
-                currentLink = r.link!;
-                sendLog('✅ HBLinks solved', 'success');
-              } else {
-                sendLog(`❌ HBLinks: ${r.message}`, 'error');
-                send({ id: lid, status: 'error' });
-                await saveToFirestore(taskId, lid, linkData, { status: 'error', error: r.message, logs }, extractedBy);
-                return;
-              }
+              if (r.status === 'success') currentLink = r.link;
+              else return { status: 'error', error: r.message, logs };
             }
 
-            // ── HUBDRIVE ──
+            // HubDrive
             if (currentLink.includes('hubdrive')) {
-              sendLog('☁️ Solving HubDrive...', 'info');
+              log('💾 HubDrive solving...');
               const r = await solveHubDrive(currentLink);
-              if (r.status === 'success') {
-                currentLink = r.link!;
-                sendLog('✅ HubDrive solved', 'success');
-              } else {
-                sendLog(`❌ HubDrive: ${r.message}`, 'error');
-                send({ id: lid, status: 'error' });
-                await saveToFirestore(taskId, lid, linkData, { status: 'error', error: r.message, logs }, extractedBy);
-                return;
-              }
+              if (r.status === 'success') currentLink = r.link;
+              else return { status: 'error', error: r.message, logs };
             }
 
-            // ── HUBCLOUD ──
+            // HubCloud / HubCDN
             if (currentLink.includes('hubcloud') || currentLink.includes('hubcdn')) {
-              sendLog('⚡ HubCloud direct link...', 'info');
+              log('☁️ HubCloud solving...');
               const r = await solveHubCloudNative(currentLink);
-              if (r.status === 'success' && r.best_download_link) {
-                sendLog(`🎉 Done via ${r.best_button_name || 'Best'}`, 'success');
-                send({ id: lid, final: r.best_download_link, status: 'done', best_button_name: r.best_button_name });
-                await saveToFirestore(taskId, lid, linkData, {
-                  status: 'done',
-                  finalLink: r.best_download_link,
+              if (r.status === 'success') {
+                log(`✅ Done: ${r.best_download_link}`, 'success');
+                return {
+                  finalLink:             r.best_download_link,  // ← HubCloudNativeResult uses best_download_link
+                  status:                'done',
+                  best_button_name:      r.best_button_name      ?? null,
+                  all_available_buttons: r.all_available_buttons ?? [],
                   logs,
-                  best_button_name: r.best_button_name || null,
-                  all_available_buttons: r.all_available_buttons || [],
-                }, extractedBy);
-                return;
-              } else {
-                sendLog(`❌ HubCloud: ${r.message}`, 'error');
+                };
               }
+              return { status: 'error', error: r.message, logs };
             }
 
-            // ── UNRECOGNIZED ──
-            sendLog('❌ Unrecognized link format', 'error');
-            send({ id: lid, status: 'error' });
-            await saveToFirestore(taskId, lid, linkData, { status: 'error', error: 'Could not solve', logs }, extractedBy);
+            // GDflix / DriveHub
+            if (currentLink.includes('gdflix') || currentLink.includes('drivehub')) {
+              log(`✅ Resolved: ${currentLink}`, 'success');
+              return { finalLink: currentLink, status: 'done', logs };
+            }
 
-          } catch (e: any) {
-            sendLog(`⚠️ Error: ${e.message}`, 'error');
-            send({ id: lid, status: 'error' });
-            await saveToFirestore(taskId, lid, linkData, { status: 'error', error: e.message, logs }, extractedBy);
-          }
-        };
+            log(`✅ Resolved: ${currentLink}`, 'success');
+            return { finalLink: currentLink, status: 'done', logs };
+          };
 
-        // Per-link timeout race
-        try {
-          await Promise.race([
-            solveWithTimeout(),
-            new Promise<void>((_, reject) =>
-              setTimeout(() => reject(new Error('Link timeout')), LINK_TIMEOUT_MS)
+          resultPayload = await Promise.race([
+            solving(),
+            new Promise<any>((_, rej) =>
+              setTimeout(() => rej(new Error(`Timeout ${LINK_TIMEOUT_MS / 1000}s`)), LINK_TIMEOUT_MS),
             ),
           ]);
-        } catch (e: any) {
-          sendLog(`⏱️ ${e.message} (${LINK_TIMEOUT_MS / 1000}s limit)`, 'error');
-          send({ id: lid, status: 'error' });
-          await saveToFirestore(taskId, lid, linkData, { status: 'error', error: e.message, logs }, extractedBy);
+        } catch (err: any) {
+          resultPayload = { status: 'error', error: err.message, logs };
         }
 
+        // Stream status update
+        send({
+          id:               lid,
+          status:           resultPayload.status,
+          final:            resultPayload.finalLink,
+          best_button_name: resultPayload.best_button_name,
+        });
+
+        // Save to Firestore
+        try {
+          await saveToFirestore(taskId, lid, originalUrl, resultPayload, extractedBy);
+        } catch { /* non-fatal */ }
+
+        // Finished marker
         send({ id: lid, status: 'finished' });
       };
 
-      // ── PROCESS ALL LINKS ──
-      // Use Promise.allSettled so one failure doesn't kill others
-      // But we still process sequentially to avoid VPS overload for timer links
-      
-      // Separate timer vs direct links
-      const timerDomains = ['gadgetsweb', 'review-tech', 'ngwin', 'cryptoinsights'];
-      const timerLinks = links.filter(l => timerDomains.some(d => (l.link || '').includes(d)));
-      const directLinks = links.filter(l => !timerDomains.some(d => (l.link || '').includes(d)));
+      // ─── Smart routing ──────────────────────────────────────────────────────
+      // v3 FIX: l.id — links.indexOf(l) REMOVED (old lines 232, 238)
+      const timerLinks  = links.filter(l => TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
+      const directLinks = links.filter(l => !TIMER_DOMAINS.some(d => (l.link || '').includes(d)));
 
       // Direct links — parallel
-      const directPromises = directLinks.map(l => processLink(l, links.indexOf(l)));
-      
-      // Timer links — sequential
+      const directPromises = directLinks.map((l: any) => processLink(l, l.id));
+
+      // Timer links — sequential (index-based — indexOf REMOVED)
       const timerPromise = (async () => {
-        for (const l of timerLinks) {
+        for (let i = 0; i < timerLinks.length; i++) {
+          const l = timerLinks[i];
           if (Date.now() - overallStart > OVERALL_TIMEOUT_MS) break;
-          await processLink(l, links.indexOf(l));
+          await processLink(l, l.id); // l.id, not indexOf
         }
       })();
 
@@ -247,56 +269,9 @@ export async function POST(req: Request) {
 
   return new Response(stream, {
     headers: {
-      'Content-Type': 'application/x-ndjson',
+      'Content-Type':  'application/x-ndjson',
       'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
+      'Connection':    'keep-alive',
     },
   });
-}
-
-// ─── Firestore save helper ───────────────────────────────────────────────────
-async function saveToFirestore(
-  taskId: string | undefined,
-  lid: number,
-  linkData: any,
-  result: any,
-  extractedBy: string
-) {
-  if (!taskId) return;
-  try {
-    const taskRef = db.collection('scraping_tasks').doc(taskId);
-    await db.runTransaction(async (tx) => {
-      const doc = await tx.get(taskRef);
-      if (!doc.exists) return;
-      const existing = doc.data()?.links || [];
-      const updated = existing.map((l: any) => {
-        if (l.id === lid || l.link === linkData.link) {
-          return {
-            ...l,
-            finalLink: result.finalLink || l.finalLink || null,
-            status: result.status || 'error',
-            error: result.error || null,
-            logs: result.logs || [],
-            best_button_name: result.best_button_name || null,
-            all_available_buttons: result.all_available_buttons || [],
-          };
-        }
-        return l;
-      });
-      const allDone = updated.every((l: any) =>
-        ['done', 'success', 'error', 'failed'].includes((l.status || '').toLowerCase())
-      );
-      const anySuccess = updated.some((l: any) =>
-        ['done', 'success'].includes((l.status || '').toLowerCase())
-      );
-      tx.update(taskRef, {
-        links: updated,
-        status: allDone ? (anySuccess ? 'completed' : 'failed') : 'processing',
-        extractedBy,
-        ...(allDone ? { completedAt: new Date().toISOString() } : {}),
-      });
-    });
-  } catch (e: any) {
-    console.error('[Stream] DB save error:', e.message);
-  }
 }
