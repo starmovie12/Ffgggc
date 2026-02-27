@@ -1,49 +1,71 @@
-export const dynamic = 'force-dynamic';
-
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/firebaseAdmin';
 
-export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const queueType = searchParams.get('type') || 'all';
-  const includeActive = searchParams.get('include_active') === 'true';
+export const dynamic = 'force-dynamic';
 
+// ─── GET /api/auto-process/queue ──────────────────────────────────────────────
+export async function GET(req: NextRequest) {
   try {
-    const results: any[] = [];
+    const { searchParams } = new URL(req.url);
+    const type           = searchParams.get('type') || 'all';           // 'movies' | 'webseries' | 'all'
+    const includeActive  = searchParams.get('include_active') === 'true'; // default false
 
-    const fetchQueue = async (col: string, label: string) => {
-      let snap;
+    const fetchQueue = async (col: string, label: 'movie' | 'webseries') => {
+      let query: FirebaseFirestore.Query;
       if (includeActive) {
-        snap = await db.collection(col).orderBy('createdAt', 'desc').limit(100).get();
+        query = db.collection(col).orderBy('createdAt', 'desc').limit(100);
       } else {
-        snap = await db.collection(col).where('status', '==', 'pending').orderBy('__name__').get();
+        query = db.collection(col).where('status', '==', 'pending');
       }
-      snap.docs.forEach(doc => results.push({ id: doc.id, collection: col, type: label, ...doc.data() }));
+      const snap = await query.get();
+      return snap.docs.map(doc => ({
+        id:         doc.id,
+        collection: col,
+        type:       label,
+        ...doc.data(),
+      }));
     };
 
-    if (queueType === 'movies' || queueType === 'all') await fetchQueue('movies_queue', 'movie');
-    if (queueType === 'webseries' || queueType === 'all') await fetchQueue('webseries_queue', 'webseries');
+    let items: any[] = [];
 
-    // If not include_active, only return pending
-    const filtered = includeActive ? results : results.filter(r => r.status === 'pending');
+    if (type === 'movies') {
+      items = await fetchQueue('movies_queue', 'movie');
+    } else if (type === 'webseries') {
+      items = await fetchQueue('webseries_queue', 'webseries');
+    } else {
+      const [movies, webseries] = await Promise.all([
+        fetchQueue('movies_queue', 'movie'),
+        fetchQueue('webseries_queue', 'webseries'),
+      ]);
+      items = [...movies, ...webseries];
+    }
 
-    return NextResponse.json({ status: 'success', total: filtered.length, items: filtered });
-  } catch (e: any) {
-    return NextResponse.json({ status: 'error', message: e.message }, { status: 500 });
+    return NextResponse.json({ status: 'success', total: items.length, items });
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
 
-export async function PATCH(req: Request) {
+// ─── PATCH /api/auto-process/queue ────────────────────────────────────────────
+export async function PATCH(req: NextRequest) {
   try {
-    const { id, collection, status, error: errorMsg } = await req.json();
-    if (!id || !collection || !status) {
-      return NextResponse.json({ status: 'error', message: 'id, collection, status required' }, { status: 400 });
+    const body = await req.json();
+    const { id, collection: col, status, error } = body;
+
+    if (!id || !col || !status) {
+      return NextResponse.json(
+        { error: 'id, collection, and status are required' },
+        { status: 400 },
+      );
     }
-    const update: any = { status, updatedAt: new Date().toISOString() };
-    if (errorMsg) update.error = errorMsg;
-    await db.collection(collection).doc(id).update(update);
+
+    const updateData: any = { status, updatedAt: new Date().toISOString() };
+    if (error !== undefined) updateData.error = error;
+
+    await db.collection(col).doc(id).update(updateData);
+
     return NextResponse.json({ status: 'success', id, newStatus: status });
-  } catch (e: any) {
-    return NextResponse.json({ status: 'error', message: e.message }, { status: 500 });
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
