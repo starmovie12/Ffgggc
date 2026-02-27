@@ -1,21 +1,13 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
-/**
- * Edge Route Protection Middleware
- * Protects /admin routes — requires valid admin session cookie.
- * Without 'mflix_admin_session' cookie, redirects to /admin with auth flag.
- */
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Only protect admin API routes that aren't the auth check itself
   if (pathname.startsWith('/api/admin')) {
     const adminKey = request.headers.get('x-admin-key');
     const adminSecret = process.env.ADMIN_SECRET;
-
     if (!adminKey || adminKey !== adminSecret) {
-      // Also check cookie-based auth
       const sessionCookie = request.cookies.get('mflix_admin_session')?.value;
       if (!sessionCookie || sessionCookie !== adminSecret) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -23,9 +15,6 @@ export function middleware(request: NextRequest) {
     }
   }
 
-  // For /admin page — check if session cookie exists
-  // If not, page will show login screen (handled client-side)
-  // But we add a security header for extra protection
   if (pathname === '/admin' || pathname.startsWith('/admin/')) {
     const response = NextResponse.next();
     response.headers.set('X-Frame-Options', 'DENY');
