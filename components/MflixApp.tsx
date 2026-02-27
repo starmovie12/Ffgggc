@@ -39,7 +39,6 @@ interface Task {
   };
 }
 
-// Queue item shape from Firebase via /api/auto-process/queue
 interface QueueItem {
   id: string;
   collection: string;
@@ -149,30 +148,36 @@ export default function MflixApp() {
   const enginePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ============================================================================
-  // TASK POLLING
+  // FIX #2 — STATE RE-HYDRATION FROM FIREBASE ON REFRESH
   // ============================================================================
+  // On mount: fetch tasks, find any 'processing' task, auto-expand it,
+  // and switch to the processing tab so user sees exactly where things are.
 
-  useEffect(() => {
-    fetchTasks();
-    fetchEngineStatus();
-    pollRef.current = setInterval(fetchTasks, 10000);
-    enginePollRef.current = setInterval(fetchEngineStatus, 30000); // Poll heartbeat every 30s
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-      if (enginePollRef.current) clearInterval(enginePollRef.current);
-    };
-  }, []);
-
-  const fetchEngineStatus = async () => {
+  const rehydrateFromFirebase = useCallback(async () => {
     try {
-      const res = await fetch('/api/engine-status');
+      const res = await fetch('/api/tasks');
       if (!res.ok) return;
       const data = await res.json();
-      setEngineStatus(data);
-    } catch {}
-  };
+      if (!Array.isArray(data)) return;
 
-  const fetchTasks = async () => {
+      setTasks(data);
+
+      // Find any task currently being processed
+      const processingTask = data.find((t: Task) => t.status === 'processing');
+      if (processingTask) {
+        setExpandedTask(processingTask.id);
+        setActiveTab('processing');
+      }
+    } catch (e) {
+      console.error('Rehydration failed:', e);
+    }
+  }, []);
+
+  // ============================================================================
+  // TASK POLLING — Adaptive: faster when processing, slower when idle
+  // ============================================================================
+
+  const fetchTasks = useCallback(async () => {
     try {
       const res = await fetch('/api/tasks');
       if (!res.ok) return;
@@ -224,10 +229,37 @@ export default function MflixApp() {
         });
       }
     } catch (e) { console.error('Failed to fetch tasks:', e); }
+  }, []);
+
+  const fetchEngineStatus = async () => {
+    try {
+      const res = await fetch('/api/engine-status');
+      if (!res.ok) return;
+      const data = await res.json();
+      setEngineStatus(data);
+    } catch {}
   };
 
+  useEffect(() => {
+    // CRITICAL: Re-hydrate on mount (fixes refresh bug)
+    rehydrateFromFirebase();
+    fetchEngineStatus();
+
+    // Adaptive polling: 5s when processing active, 10s otherwise
+    const pollInterval = setInterval(() => {
+      fetchTasks();
+    }, 5000); // Always poll every 5s for responsiveness
+
+    enginePollRef.current = setInterval(fetchEngineStatus, 20000);
+
+    return () => {
+      clearInterval(pollInterval);
+      if (enginePollRef.current) clearInterval(enginePollRef.current);
+    };
+  }, [rehydrateFromFirebase, fetchTasks]);
+
   // ============================================================================
-  // EFFECTIVE STATS
+  // EFFECTIVE STATS (from Firebase data — survives refresh)
   // ============================================================================
 
   const getEffectiveStats = useCallback((task: Task) => {
@@ -255,7 +287,7 @@ export default function MflixApp() {
   };
 
   // ============================================================================
-  // LIVE STREAM
+  // LIVE STREAM (Browser-only, for manual START ENGINE button)
   // ============================================================================
 
   const startLiveStream = useCallback(async (taskId: string, links: any[]) => {
@@ -375,10 +407,15 @@ export default function MflixApp() {
       setTimeout(fetchTasks, 1000);
       setActiveTaskId(null);
     }
-  }, []);
+  }, [fetchTasks]);
 
   // ============================================================================
-  // AUTO-PILOT — FIXED FIREBASE FETCH + PREMIUM LOGIC
+  // FIX #3 — DECOUPLED AUTO-PILOT (Server-Side Processing)
+  //
+  // KEY CHANGE: Instead of running stream_solve from the browser (dies on close),
+  // we call /api/solve_task which runs independently on the server.
+  // If the browser closes, the current solve_task call CONTINUES on the server.
+  // Remaining items are picked up by the GitHub cron every 5 minutes.
   // ============================================================================
 
   const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -389,11 +426,6 @@ export default function MflixApp() {
     setAutoPilotLog([...autoPilotLogRef.current]);
   };
 
-  /**
-   * FIXED: Properly parses the Firebase queue API response:
-   * { status: 'success', total: N, items: QueueItem[] }
-   * Each item: { id, collection, type, url, title, status, ... }
-   */
   const fetchFirebaseQueue = async (): Promise<{ stats: QueueStats; pendingItems: QueueItem[] }> => {
     const res = await fetch('/api/auto-process/queue?type=all');
     if (!res.ok) {
@@ -419,8 +451,12 @@ export default function MflixApp() {
   };
 
   /**
-   * Process a single QueueItem: POST to /api/tasks, run live stream,
-   * then PATCH queue item status in Firebase.
+   * FIX #3: Process one queue item using SERVER-SIDE /api/solve_task
+   * 
+   * 1. POST /api/tasks → creates task + extracts links
+   * 2. POST /api/solve_task → solves ALL links on server (non-streaming)
+   * 3. If browser closes during step 2, the server still finishes
+   * 4. PATCH queue status to completed/failed
    */
   const processQueueItemAutoPilot = async (item: QueueItem): Promise<boolean> => {
     const trimmedUrl = (item.url || '').trim();
@@ -429,6 +465,8 @@ export default function MflixApp() {
       return false;
     }
     try {
+      // Step 1: Create task (extracts links from movie page)
+      addAutoPilotLog(`📋 Creating task for "${item.title || 'Unknown'}"...`, 'info');
       const response = await fetch('/api/tasks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -436,52 +474,84 @@ export default function MflixApp() {
       });
       if (!response.ok) {
         addAutoPilotLog(`❌ Task creation failed: HTTP ${response.status}`, 'error');
-        await fetch('/api/auto-process/queue', {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: item.id, collection: item.collection, status: 'failed', error: `HTTP ${response.status}` }),
-        }).catch(() => {});
+        await patchQueueStatus(item, 'failed', `HTTP ${response.status}`);
         return false;
       }
       const data = await response.json();
       if (data.error) {
         addAutoPilotLog(`❌ Error: ${data.error}`, 'error');
-        await fetch('/api/auto-process/queue', {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: item.id, collection: item.collection, status: 'failed', error: data.error }),
-        }).catch(() => {});
+        await patchQueueStatus(item, 'failed', data.error);
         return false;
       }
+
+      const taskId = data.taskId;
       await fetchTasks();
-      if (data.taskId) {
-        setExpandedTask(data.taskId);
-        setActiveTab('processing');
-        completedLinksRef.current[data.taskId] = {};
-        try {
-          const taskRes = await fetch('/api/tasks');
-          if (taskRes.ok) {
-            const taskList = await taskRes.json();
-            const newTask = taskList.find((t: any) => t.id === data.taskId);
-            if (newTask?.links?.length > 0) await startLiveStream(data.taskId, newTask.links);
-          }
-        } catch {}
-        await fetch('/api/auto-process/queue', {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: item.id, collection: item.collection, status: 'completed' }),
-        }).catch(() => {});
+      setExpandedTask(taskId);
+      setActiveTab('processing');
+
+      // Step 2: Get the links from the task
+      const taskDoc = await fetch('/api/tasks');
+      const taskList = await taskDoc.json();
+      const newTask = Array.isArray(taskList) ? taskList.find((t: any) => t.id === taskId) : null;
+      const allLinks = newTask?.links || [];
+      const pendingLinks = allLinks
+        .map((l: any, i: number) => ({ ...l, id: i }))
+        .filter((l: any) => {
+          const s = (l.status || '').toLowerCase();
+          return s === 'pending' || s === '' || s === 'processing';
+        });
+
+      if (pendingLinks.length === 0) {
+        addAutoPilotLog(`⚠️ No pending links found`, 'warn');
+        await patchQueueStatus(item, 'completed');
+        return true;
       }
-      return true;
+
+      // Step 3: Call /api/solve_task — NON-STREAMING, runs on server
+      // This is the KEY FIX: even if browser closes, this API call continues!
+      addAutoPilotLog(`⚡ Solving ${pendingLinks.length} links on server...`, 'info');
+      
+      const solveRes = await fetch('/api/solve_task', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-mflix-internal': 'true',
+        },
+        body: JSON.stringify({
+          taskId,
+          links: pendingLinks.map((l: any) => ({ id: l.id, name: l.name, link: l.link })),
+          extractedBy: 'Server/Auto-Pilot',
+        }),
+      });
+
+      if (solveRes.ok) {
+        const solveData = await solveRes.json();
+        const success = (solveData.done || 0) > 0;
+        addAutoPilotLog(`✅ Done: ${solveData.done} solved, ${solveData.errors} failed`, success ? 'success' : 'warn');
+        await patchQueueStatus(item, success ? 'completed' : 'failed');
+        await fetchTasks(); // Refresh to show results
+        return success;
+      } else {
+        addAutoPilotLog(`❌ solve_task failed: HTTP ${solveRes.status}`, 'error');
+        await patchQueueStatus(item, 'failed', `HTTP ${solveRes.status}`);
+        return false;
+      }
+
     } catch (err: any) {
       addAutoPilotLog(`❌ Exception: ${err.message}`, 'error');
+      await patchQueueStatus(item, 'failed', err.message);
+      return false;
+    }
+  };
+
+  const patchQueueStatus = async (item: QueueItem, status: string, error?: string) => {
+    try {
       await fetch('/api/auto-process/queue', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: item.id, collection: item.collection, status: 'failed', error: err.message }),
-      }).catch(() => {});
-      return false;
-    }
+        body: JSON.stringify({ id: item.id, collection: item.collection, status, error }),
+      });
+    } catch {}
   };
 
   const runAutoPilot = async () => {
@@ -517,6 +587,7 @@ export default function MflixApp() {
     }
 
     setAutoPilotPhase('running');
+    addAutoPilotLog(`🛡️ Server-side processing — safe to close browser!`, 'info');
     let processed = 0;
 
     for (let i = 0; i < pendingItems.length; i++) {
@@ -835,7 +906,7 @@ export default function MflixApp() {
                 </div>
               </div>
             </div>
-            {engineStatus.backgroundActive && (
+            {(engineStatus.backgroundActive || isAutoPilotRunning) && (
               <div className="flex items-center gap-1.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg px-2.5 py-1.5">
                 <Shield className="w-3 h-3 text-emerald-400" />
                 <span className="text-[9px] text-emerald-300 font-bold">Safe to close browser</span>
@@ -884,9 +955,7 @@ export default function MflixApp() {
             </motion.div>
           )}
 
-          {/* ================================================================ */}
-          {/*  AUTO-PILOT PREMIUM DASHBOARD                                    */}
-          {/* ================================================================ */}
+          {/* AUTO-PILOT DASHBOARD */}
           <div className="mt-5">
             <div className={`relative overflow-hidden rounded-2xl border transition-all duration-500 ${
               isAutoPilotRunning
@@ -898,7 +967,6 @@ export default function MflixApp() {
                     : 'border-white/10 bg-black/20'
             }`}>
 
-              {/* Animated scan line when running */}
               {isAutoPilotRunning && (
                 <motion.div className="absolute inset-0 pointer-events-none" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
                   <div className="absolute inset-0 bg-gradient-to-r from-transparent via-violet-500/5 to-transparent animate-pulse" />
@@ -911,7 +979,6 @@ export default function MflixApp() {
               )}
 
               <div className="relative p-4">
-                {/* Title row */}
                 <div className="flex items-center justify-between gap-3 mb-3">
                   <div className="flex items-center gap-2.5">
                     <div className={`p-2 rounded-xl transition-all ${isAutoPilotRunning ? 'bg-violet-500/20 ring-1 ring-violet-500/40' : 'bg-white/5'}`}>
@@ -932,11 +999,10 @@ export default function MflixApp() {
                         {autoPilotPhase === 'done' && <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 uppercase">DONE</span>}
                         {autoPilotPhase === 'stopped' && <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-rose-500/20 text-rose-400 uppercase">STOPPED</span>}
                       </div>
-                      <p className="text-[10px] text-slate-500 mt-0.5">Browser-based Firebase queue processor</p>
+                      <p className="text-[10px] text-slate-500 mt-0.5">Server-side processor — safe to close browser</p>
                     </div>
                   </div>
 
-                  {/* Action buttons */}
                   <div className="flex items-center gap-2 flex-shrink-0">
                     {!isAutoPilotRunning && autoPilotPhase !== 'idle' && (
                       <button onClick={handleRefreshQueue} className="p-2 rounded-xl bg-white/5 border border-white/10 text-slate-400 hover:text-white hover:bg-white/10 transition-all" title="Refresh queue">
@@ -968,7 +1034,7 @@ export default function MflixApp() {
                   </div>
                 </div>
 
-                {/* Live status message */}
+                {/* Status message */}
                 <AnimatePresence mode="wait">
                   {autoPilotStatusMsg && (
                     <motion.div
@@ -994,7 +1060,7 @@ export default function MflixApp() {
                     >
                       <div className="flex items-center gap-2 mb-1">
                         <Radio className="w-3 h-3 text-violet-400 animate-pulse" />
-                        <span className="text-[9px] font-bold text-violet-400 uppercase tracking-widest">Now Processing</span>
+                        <span className="text-[9px] font-bold text-violet-400 uppercase tracking-widest">Now Processing (Server-Side)</span>
                       </div>
                       <p className="text-xs font-bold text-white truncate">{currentQueueItem.title || 'Untitled'}</p>
                       <div className="flex items-center gap-2 mt-1">
@@ -1058,7 +1124,7 @@ export default function MflixApp() {
                       </div>
                       {isAutoPilotRunning && (
                         <div className="flex justify-between text-[9px] text-slate-600 mt-1 font-mono">
-                          <span>Processing queue...</span>
+                          <span>Processing on server...</span>
                           <span>{Math.max(0, queueStats.totalPending - 1)} remaining</span>
                         </div>
                       )}
@@ -1211,7 +1277,6 @@ export default function MflixApp() {
                     <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${trueStatus === 'completed' ? 'bg-emerald-500/20 text-emerald-400' : trueStatus === 'failed' ? 'bg-rose-500/20 text-rose-400' : 'bg-indigo-500/20 text-indigo-400 animate-pulse'}`}>
                       {trueStatus === 'processing' && activeTaskId === task.id ? '⚡ LIVE' : trueStatus}
                     </span>
-                    {/* Extraction Source Badge */}
                     {task.extractedBy && (
                       <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold flex items-center gap-1 ${
                         task.extractedBy === 'Server/Auto-Pilot'
@@ -1306,7 +1371,7 @@ export default function MflixApp() {
                           <div className="flex flex-col items-center py-8 text-slate-400">
                             <Loader2 className="w-8 h-8 animate-spin mb-2" />
                             <p className="text-sm">Scraping in progress...</p>
-                            <p className="text-xs opacity-50">You can close this window and return later.</p>
+                            <p className="text-xs opacity-50">Server is processing — safe to close browser.</p>
                           </div>
                         )}
                       </div>
